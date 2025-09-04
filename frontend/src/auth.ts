@@ -1,70 +1,47 @@
-import { ref, computed, onMounted } from 'vue'
-import { getMe } from './api'
+// src/auth.ts
+import { ref } from 'vue';
 
-// === token ===
-export const token = ref<string | null>(localStorage.getItem('token'))
-export const isAuthenticated = computed(() => !!token.value)
+export const currentUser = ref<any | null>(null);
 
-// === currentUser ===
-export type CurrentUser = {
-  id: number; name: string; email: string; phone: string; avatarUrl: string; role: 'admin' | 'user'  
+export function setAuth(token: string, user: any) {
+  localStorage.setItem('token', token);
+  localStorage.setItem('user', JSON.stringify(user));
+  currentUser.value = user;
 }
-export const currentUser = ref<CurrentUser | null>(null)
-
-// --- helpers lưu/đọc user từ localStorage (giảm nháy UI sau reload) ---
-const USER_KEY = 'currentUser'
-function saveUserToStorage(u: CurrentUser | null) {
-  if (!u) localStorage.removeItem(USER_KEY)
-  else localStorage.setItem(USER_KEY, JSON.stringify(u))
+export function setUser(user: any) {
+  localStorage.setItem('user', JSON.stringify(user));
+  currentUser.value = user;
 }
-function loadUserFromStorage(): CurrentUser | null {
-  try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null') } catch { return null }
-}
-
-export function setToken(t: string) {
-  token.value = t
-  localStorage.setItem('token', t)
-}
-export function clearToken() {
-  token.value = null
-  localStorage.removeItem('token')
-  currentUser.value = null
-  saveUserToStorage(null)
+export function getToken(): string | null { return localStorage.getItem('token'); }
+export function isAuthenticated(): boolean { return !!getToken(); }
+export function clearAuth() {
+  localStorage.removeItem('token');
+  localStorage.removeItem('user');
+  currentUser.value = null;
 }
 
-// gọi sau khi đăng nhập / hoặc lúc khởi động
 export async function fetchCurrentUser() {
-  if (!token.value) { currentUser.value = null; saveUserToStorage(null); return }
-  try {
-    const { data } = await getMe()
-    currentUser.value = data.user as CurrentUser
-    saveUserToStorage(currentUser.value)
-  } catch {
-    // token hỏng
-    clearToken()
-  }
+  const base = import.meta.env.VITE_API_BASE ?? 'http://localhost:8080';
+  const token = getToken();
+  if (!token) { currentUser.value = null; return; }
+  const res = await fetch(`${base}/private/me`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  if (!res.ok) { currentUser.value = null; return; }
+  const data = await res.json();
+  currentUser.value = data.user;
+  localStorage.setItem('user', JSON.stringify(data.user));
 }
-
-// === Khởi tạo khi load app ===
-// 1) hydrate user từ localStorage để không nháy
-// 2) nếu có token thì gọi /me để đồng bộ thật
-export function initAuth() {
-  const cached = loadUserFromStorage()
-  if (cached) currentUser.value = cached
-  if (token.value) {
-    // không await để app mount nhanh, nhưng bạn có thể await trong main.ts nếu muốn
-    fetchCurrentUser()
+// Khởi tạo state từ localStorage và (tùy chọn) refresh từ server
+export function initAuth(opts: { refresh?: boolean } = { refresh: true }) {
+  const raw = localStorage.getItem('user');
+  if (raw) {
+    try { currentUser.value = JSON.parse(raw); }
+    catch { currentUser.value = null; }
+  } else {
+    currentUser.value = null;
   }
-}
-
-// Đồng bộ token giữa nhiều tab
-export function useAuthSync() {
-  onMounted(() => {
-    window.addEventListener('storage', (e) => {
-      if (e.key === 'token') token.value = e.newValue
-      if (e.key === USER_KEY) {
-        try { currentUser.value = JSON.parse(e.newValue || 'null') } catch { /* noop */ }
-      }
-    })
-  })
+  if (opts.refresh) {
+    fetchCurrentUser().catch(() => { /* ignore */ });
+  }
 }

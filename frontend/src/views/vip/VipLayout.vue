@@ -1,28 +1,26 @@
+<script setup lang="ts">
+import { computed } from 'vue';
+import { currentUser } from '../../auth';
+const me = computed(()=> currentUser.value);
+</script>
+
 <template>
-  <section class="vip-wrap">
-    <header class="vip-header">
-      <h2>Khu vực VIP</h2>
-      <router-link to="/vip" class="tab" exact-active-class="tab--active">Thông tin VIP</router-link>
-      <router-link
-        v-if="currentUser?.role === 'admin'"
-        to="/vip/admin"
-        class="tab"
-        exact-active-class="tab--active"
-      >Quản lý hệ thống</router-link>
-    </header>
-    <div class="vip-body">
+  <section class="wrap">
+    <h2>VIP</h2>
+    <nav class="subnav">
+      <router-link :to="{ name:'vip-info' }" exact-active-class="active">Thông tin VIP</router-link>
+      <router-link v-if="me?.role==='admin'" :to="{ name:'vip-admin' }" exact-active-class="active">Quản trị hệ thống</router-link>
+    </nav>
+    <div class="content">
       <router-view />
     </div>
   </section>
 </template>
 
-<script setup lang="ts">
-import { currentUser } from '../../auth'
-</script>
-
 <style scoped>
-.vip-header{ display:flex; align-items:center; gap:12px; margin-bottom:12px; }
-.tab{ padding:6px 10px; border-radius:8px; text-decoration:none; color:#555; border:1px solid transparent; }
-.tab--active{ border-color:#1e80ff33; background:#1e80ff12; color:#1e80ff; }
-.vip-body{ padding:8px 0; }
+.wrap{ max-width: 1100px; margin: 16px auto; padding: 0 12px; }
+.subnav{ display:flex; gap:8px; border-bottom:1px solid #eee; margin-top:8px; }
+.subnav a{ padding:8px 12px; border-radius:10px 10px 0 0; text-decoration:none; color:#333; }
+.subnav a.active{ background:#e9f1ff; color:#1e80ff; }
+.content{ padding:16px 0; }
 </style>

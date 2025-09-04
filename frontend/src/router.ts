@@ -1,38 +1,38 @@
+// router.ts
 import { createRouter, createWebHistory } from 'vue-router'
-import Home from './views/Home.vue'
-import Profile from './views/Profile.vue'
-import VipLayout from './views/vip/VipLayout.vue'
-import VipInfo from './views/vip/VipInfo.vue'
-import VipAdmin from './views/vip/VipAdmin.vue'
-import { isAuthenticated, currentUser } from './auth'
-import { openAuth } from './panelAuth'
+import type { RouteRecordRaw } from 'vue-router'
+import { getToken } from './auth' 
 
-export const router = createRouter({
-  history: createWebHistory(),
-  routes: [
-    { path: '/', redirect: '/home' },
-    { path: '/home', component: Home },
-    { path: '/profile', component: Profile, meta: { requiresAuth: true } },
+const routes: RouteRecordRaw[] = [
+  { path: '/', name: 'home', component: () => import('./views/Home.vue') },
+ { path: '/home', redirect: { name: 'home' } }, 
+  { path: '/profile', name: 'profile', meta: { requiresAuth: true }, component: () => import('./views/Profile.vue') },
+   {
+    path: '/vip',
+    component: () => import('./views/vip/VipLayout.vue'), // 👈 Sửa path nếu file bạn ở chỗ khác
+    meta: { requiresAuth: true },
+    children: [
+      { path: '', redirect: { name: 'vip-info' } }, // /vip -> /vip/info
+      { path: 'info',  name: 'vip-info',  component: () => import('./views/vip/VipInfo.vue') },
+      { path: 'admin', name: 'vip-admin', component: () => import('./views/vip/VipAdmin.vue'), meta: { requiresAdmin: true } },
+      { path: '/wallet', name: 'wallet', meta: { requiresAuth: true }, component: () => import('./views/Wallet.vue') },
+      // router.ts
+{ path: '/referral', name: 'referral', meta: { requiresAuth: true }, component: () => import('./views/Referral.vue') },
 
-    { // /vip có layout riêng và menu bên trong
-      path: '/vip',
-      component: VipLayout,
-      meta: { requiresAuth: true },
-      children: [
-        { path: '', component: VipInfo },                       // /vip → Thông tin VIP
-        { path: 'admin', component: VipAdmin, meta: { adminOnly: true } }, // /vip/admin
-      ],
-    },
-  ],
+
+    ]
+  },
+]
+
+const router = createRouter({ history: createWebHistory(), routes })
+
+router.beforeEach((to, _from, next) => {
+  const authed = !!localStorage.getItem('token')
+  const isHome = (to.name === 'home') || (to.path === '/' || to.path === '/home')
+  if (!authed && !isHome) {
+    return { name: 'home' }
+  }
+  next()
 })
 
-router.beforeEach((to) => {
-  if (to.meta.requiresAuth && !isAuthenticated.value) {
-    openAuth('login', to.fullPath); return false
-  }
-  if (to.meta.adminOnly) {
-    if (!isAuthenticated.value) { openAuth('login', to.fullPath); return false }
-    if (currentUser.value?.role !== 'admin') { return { path: '/vip' } }
-  }
-  return true
-})
+export default router

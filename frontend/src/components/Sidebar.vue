@@ -10,10 +10,21 @@
     <span>Home</span>
   </router-link>
 
-  <router-link to="/vip" class="item" active-class="active">
-    <span class="icon" aria-hidden="true" v-html="icons.crown"></span>
-    <span>VIP</span>
-  </router-link>
+ <router-link :to="{ name: 'vip-info' }" class="item" exact-active-class="active">
+  <span class="icon" aria-hidden="true" v-html="icons.crown"></span>
+  <span>VIP</span>
+</router-link>
+
+<router-link :to="{ name: 'wallet' }" class="item" exact-active-class="active">
+  <span class="icon" aria-hidden="true" v-html="icons.wallet"></span>
+  <span>Ví</span>
+</router-link>
+<router-link :to="{ name:'referral' }" class="item" exact-active-class="active">
+  <span class="icon" aria-hidden="true" v-html="icons.users"></span>
+  <span>Mời bạn bè</span>
+</router-link>
+
+
 </nav>
 
       
@@ -31,6 +42,17 @@ const icons = {
   crown: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
     <path d="M3 7l5 5 4-8 4 8 5-5"/><path d="M2 19h20"/></svg>`,
+  wallet: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+    stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M20 7H4a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h16z"/>
+    <path d="M16 7V5a2 2 0 0 0-2-2H4"/>
+    <circle cx="16" cy="12" r="1"/></svg>`,
+  users: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+  stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M17 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2"/>
+  <circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+  <path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
+
 }
 </script>
 

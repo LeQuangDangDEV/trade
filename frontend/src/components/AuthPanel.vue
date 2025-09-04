@@ -1,34 +1,25 @@
-<template>
-  <SlideOver :open="authPanelOpen" @close="closeAuth" :title="title">
-    <!-- ✅ Dùng biến component (KHÔNG dùng chuỗi) -->
-    <component
-      :is="authPanelMode === 'login' ? LoginForm : RegisterForm"
-      @switch="onSwitch"
-      @done="onDone"
-    />
-  </SlideOver>
-</template>
-
+<!-- src/components/AuthPanel.vue -->
 <script setup lang="ts">
 import { computed } from 'vue'
-import SlideOver from './SlideOver.vue'
-import LoginForm from './LoginForm.vue'      // ⬅️ biến component
-import RegisterForm from './RegisterForm.vue'// ⬅️ biến component
-import { authPanelOpen, authPanelMode, authNextPath, closeAuth } from '../panelAuth'
-import { useRouter } from 'vue-router'
+import { authMode, closeAuth } from '../panelAuth'
+import LoginForm from './LoginForm.vue'
+import RegisterForm from './RegisterForm.vue'
 
-const router = useRouter()
-const title = computed(() =>
-  authPanelMode.value === 'login' ? 'Đăng nhập' : 'Đăng ký'
-)
-
-function onSwitch(mode: 'login' | 'register') {
-  authPanelMode.value = mode
-}
-
-function onDone() {
-  const next = authNextPath.value || '/home'
-  closeAuth()
-  router.push(next)
-}
+const comp = computed(() => authMode.value === 'register' ? RegisterForm : LoginForm)
 </script>
+
+<template>
+  <teleport to="body">
+    <div v-if="authMode" class="modal-backdrop" @click.self="closeAuth()">
+      <div class="modal">
+        <!-- key theo mode để remount form, tránh patchKeyedChildren lỗi -->
+        <component :is="comp" :key="authMode" />
+      </div>
+    </div>
+  </teleport>
+</template>
+
+<style scoped>
+.modal-backdrop{position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; z-index:9999;}
+.modal{ width:min(460px,94vw); background:#fff; border-radius:14px; padding:16px; box-shadow:0 20px 60px rgba(0,0,0,.25); }
+</style>
