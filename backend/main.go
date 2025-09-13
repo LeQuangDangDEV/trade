@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	mathrand "math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -38,6 +39,23 @@ var DB *gorm.DB
 var uploadsAbs string
 var kycAbs string
 
+type DashboardOverview struct {
+	TotalAssets           int64 `json:"totalAssets"` // coins + bonusCoins
+	F1Count               int64 `json:"f1Count"`
+	F1CommissionTotal     int64 `json:"f1CommissionTotal"`
+	SystemCount           int64 `json:"systemCount"`           // F1..F9
+	SystemCommissionTotal int64 `json:"systemCommissionTotal"` // depth 1..9
+}
+type DailyCommission struct {
+	Day    int   `json:"day"`
+	Amount int64 `json:"amount"`
+}
+type MonthlyCommissionResp struct {
+	Year       int               `json:"year"`
+	Month      int               `json:"month"`
+	Days       []DailyCommission `json:"days"`
+	MonthTotal int64             `json:"monthTotal"`
+}
 type AdminUserDetail struct {
 	ID         uint   `json:"id"`
 	Username   string `json:"username"`
@@ -56,7 +74,13 @@ type AdminUserDetail struct {
 	HasKYCFront bool   `json:"hasKycFront"`
 	HasKYCBack  bool   `json:"hasKycBack"`
 }
-
+type DownlineRow struct {
+	ID        uint   `json:"id"`
+	Username  string `json:"username"`
+	Depth     int    `json:"depth"`
+	VIPLevel  int    `gorm:"column:v_ip_level;not null;default:0" json:"vipLevel"`
+	CreatedAt string `json:"createdAt"`
+}
 type WithdrawRequest struct {
 	UserID uint   `json:"userId" binding:"required"`
 	Amount int64  `json:"amount" binding:"required,gt=0"`
@@ -71,10 +95,12 @@ type User struct {
 	AvatarURL    string `json:"avatarUrl"`
 	PasswordHash string `json:"-"`
 
-	Role       string `gorm:"type:enum('admin','user');default:'user';index" json:"role"`
-	Coins      int64  `gorm:"not null;default:0" json:"coins"`
-	TotalTopup int64  `gorm:"not null;default:0" json:"totalTopup"`
-	VIPLevel   int    `gorm:"column:v_ip_level;not null;default:0" json:"vipLevel"`
+	Role                 string `gorm:"type:enum('admin','user');default:'user';index" json:"role"`
+	Coins                int64  `gorm:"not null;default:0" json:"coins"`
+	TotalTopup           int64  `gorm:"not null;default:0" json:"totalTopup"`
+	VIPLevel             int    `gorm:"column:v_ip_level;not null;default:0" json:"vipLevel"`
+	BonusCoins           int64  `gorm:"not null;default:0" json:"bonusCoins"`
+	Invite10VipBonusPaid bool   `gorm:"not null;default:false" json:"-"`
 
 	SecondPasswordHash string `json:"-"`
 	TxnPinHash         string `json:"-"`
@@ -93,6 +119,9 @@ type User struct {
 	CreatedAt    time.Time      `json:"createdAt"`
 	UpdatedAt    time.Time      `json:"updatedAt"`
 	DeletedAt    gorm.DeletedAt `gorm:"index" json:"-"`
+	// 🔹 Free spins (lượt quay miễn phí)
+	FreeSpins      int `gorm:"not null;default:0" json:"freeSpins"`
+	ChestOpenCount int `gorm:"not null;default:0"`
 }
 
 type ChangePasswordRequest struct {
@@ -153,6 +182,9 @@ type ReferralReward struct {
 type BuyVipRequest struct {
 	Level int `json:"level" binding:"required,gt=0"`
 }
+type RedeemReq struct {
+	Code string `json:"code" binding:"required"`
+}
 
 // Giao dịch chuyển coin user→user
 type TransferTxn struct {
@@ -199,14 +231,6 @@ type WithdrawTxn struct {
 
 	User  User `gorm:"foreignKey:UserID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT;"`
 	Admin User `gorm:"foreignKey:AdminID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT;"`
-}
-
-type kycUpdateReq struct {
-	FrontURL string `json:"frontUrl"` // FE gửi url /uploads/xxx.png
-	BackURL  string `json:"backUrl"`
-	// chấp nhận alias cũ nếu bạn từng dùng:
-	FrontPath string `json:"frontPath"`
-	BackPath  string `json:"backPath"`
 }
 
 type TransferRequest struct {
@@ -258,6 +282,37 @@ type VipBuyRow struct {
 	Price     int64     `json:"price"`
 	OldLevel  int       `json:"oldLevel"`
 	CreatedAt time.Time `json:"createdAt"`
+}
+
+type Notification struct {
+	ID        uint      `gorm:"primaryKey"             json:"id"`
+	UserID    uint      `gorm:"index;not null"         json:"userId"`
+	Title     string    `gorm:"size:120;not null"      json:"title"`
+	Body      string    `gorm:"size:500;not null"      json:"body"`
+	IsRead    bool      `gorm:"not null;default:false" json:"isRead"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+type PromoCode struct {
+	ID             uint       `gorm:"primaryKey"`
+	Code           string     `gorm:"size:32;uniqueIndex;not null"`
+	RewardFreeSpin int        `gorm:"not null;default:10"` // số lượt quay tặng
+	MaxUses        *int       `gorm:""`                    // NULL => vô hạn
+	UsedCount      int        `gorm:"not null;default:0"`
+	ExpiresAt      *time.Time `gorm:"index"` // hết hạn sau 24h
+	IsActive       bool       `gorm:"not null;default:true"`
+	CreatedBy      *uint
+	CreatedAt      time.Time
+}
+type PromoCodeUse struct {
+	ID          uint      `gorm:"primaryKey"`
+	PromoCodeID uint      `gorm:"index;not null"`
+	UserID      uint      `gorm:"index;not null"`
+	UsedAt      time.Time `gorm:"autoCreateTime"`
+
+	// Mỗi (code, user) chỉ 1 lần
+	_            struct{} `gorm:"uniqueIndex:uniq_code_user,composite"`
+	PromoCodeID2 uint     `gorm:"-"` // dummy to keep tag line compile-friendly in older gorm
 }
 
 type VipTier struct {
@@ -324,8 +379,8 @@ const (
 // item trong túi
 type InventoryItem struct {
 	ID        uint      `gorm:"primaryKey" json:"-"`
-	UserID    uint      `gorm:"index;not null" json:"-"`
-	Code      string    `gorm:"size:10;not null;index" json:"code"`
+	UserID    uint      `gorm:"not null;uniqueIndex:uniq_user_code" json:"-"`
+	Code      string    `gorm:"size:10;not null;uniqueIndex:uniq_user_code" json:"code"`
 	Qty       int64     `gorm:"not null;default:0"   json:"qty"`
 	CreatedAt time.Time `json:"-"`
 	UpdatedAt time.Time `json:"-"`
@@ -340,6 +395,25 @@ type ChestTxn struct {
 	RewardCode   string `gorm:"size:10"`          // DB1..DB7 (nếu là DRAGON_BALL)
 	RewardAmount int64  `gorm:"not null"`         // coin nếu COIN, còn DB là 1
 	CreatedAt    time.Time
+}
+type DashOverview struct {
+	TotalAssets           int64 `json:"totalAssets"` // coins + bonusCoins
+	F1Count               int64 `json:"f1Count"`
+	F1CommissionTotal     int64 `json:"f1CommissionTotal"`     // depth=1
+	SystemCommissionTotal int64 `json:"systemCommissionTotal"` // depth 1..9
+}
+
+type DayEarning struct {
+	Day    int   `json:"day"`
+	Amount int64 `json:"amount"`
+}
+
+type DownlineDashboardResp struct {
+	UserID   uint              `json:"userId"`
+	Username string            `json:"username"`
+	Overview DashboardOverview `json:"overview"`
+	Month    string            `json:"month"` // YYYY-MM
+	Earnings []DayEarning      `json:"earnings"`
 }
 
 // bài đăng trên chợ
@@ -407,10 +481,12 @@ func connectDB() {
 		&CommissionTxn{},
 		&WithdrawTxn{},
 		&InventoryItem{}, &ChestTxn{}, &MarketListing{},
+		&Notification{},
+		&PromoCode{}, &PromoCodeUse{},
 	); err != nil {
 		log.Fatal("❌ AutoMigrate error:", err)
 	}
-
+	collapseInventoryDuplicates()
 	seedVipTiers()
 	fmt.Println("✅ DB migrated")
 }
@@ -420,6 +496,48 @@ func getAnyAdmin(tx *gorm.DB) (User, error) {
 	var admin User
 	err := tx.Where("role = ?", "admin").Order("id ASC").First(&admin).Error
 	return admin, err
+}
+
+// Trả về danh sách ID F1 và toàn bộ F1..F9 (không trùng)
+func downlineIDsByDepth(tx *gorm.DB, root uint, maxDepth int) (f1IDs []uint, allIDs []uint, err error) {
+	current := []uint{root}
+	seen := map[uint]bool{}
+
+	for depth := 1; depth <= maxDepth; depth++ {
+		var next []uint
+		if err := tx.Model(&User{}).
+			Where("referred_by IN ?", current).
+			Pluck("id", &next).Error; err != nil {
+			return nil, nil, err
+		}
+		if len(next) == 0 {
+			break
+		}
+		if depth == 1 {
+			f1IDs = append(f1IDs, next...)
+		}
+		for _, id := range next {
+			if !seen[id] {
+				seen[id] = true
+				allIDs = append(allIDs, id)
+			}
+		}
+		current = next
+	}
+	return
+}
+
+func randCode(n int) (string, error) {
+	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		num, err := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		if err != nil {
+			return "", err
+		}
+		b[i] = letters[num.Int64()]
+	}
+	return string(b), nil
 }
 
 // Lấy tối đa 9 cấp upline theo trường referred_by
@@ -437,7 +555,8 @@ func getUplines(tx *gorm.DB, start *uint, maxDepth int) ([]User, error) {
 		}
 		seen[*cur] = true
 		var u User
-		if err := tx.Select("id, email, coins, v_ip_level, referred_by").First(&u, *cur).Error; err != nil {
+		if err := tx.Select("id, username, coins, v_ip_level, referred_by").
+			First(&u, *cur).Error; err != nil {
 			break
 		}
 		out = append(out, u)
@@ -507,6 +626,60 @@ func seedVipTiers() {
 	DB.Create(&tiers)
 	fmt.Println("🌱 Seeded vip_tiers (MinTopup)")
 }
+func overviewStatsHandler(c *gin.Context) {
+	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+
+	var user User
+	if err := DB.First(&user, uid).Error; err != nil {
+		c.JSON(404, gin.H{"error": "User không tồn tại"})
+		return
+	}
+
+	// a) KPI theo phần bạn nhận (UPLINE)
+	var f1CommissionUser int64
+	DB.Model(&CommissionTxn{}).
+		Where("beneficiary_id = ? AND kind = ? AND depth = 1", uid, "UPLINE").
+		Select("COALESCE(SUM(amount),0)").Scan(&f1CommissionUser)
+
+	var systemCommissionUser int64
+	DB.Model(&CommissionTxn{}).
+		Where("beneficiary_id = ? AND kind = ? AND depth BETWEEN 1 AND 9", uid, "UPLINE").
+		Select("COALESCE(SUM(amount),0)").Scan(&systemCommissionUser)
+
+	// b) KPI tổng phát sinh trong cây của bạn (bao gồm ADMIN)
+	f1IDs, allIDs, err := downlineIDsByDepth(DB, uid, 9)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Không lấy được thống kê"})
+		return
+	}
+	var f1CommissionGross, systemCommissionGross int64
+	if len(f1IDs) > 0 {
+		DB.Model(&CommissionTxn{}).
+			Where("buyer_id IN ?", f1IDs).
+			Select("COALESCE(SUM(amount),0)").Scan(&f1CommissionGross)
+	}
+	if len(allIDs) > 0 {
+		DB.Model(&CommissionTxn{}).
+			Where("buyer_id IN ?", allIDs).
+			Select("COALESCE(SUM(amount),0)").Scan(&systemCommissionGross)
+	}
+
+	totalAssets := user.Coins + user.BonusCoins
+
+	c.JSON(200, gin.H{
+		"totalAssets": totalAssets,
+		"f1Count":     len(f1IDs),
+		"systemCount": len(allIDs),
+
+		// bạn nhận (UPLINE)
+		"f1CommissionUser":     f1CommissionUser,
+		"systemCommissionUser": systemCommissionUser,
+
+		// tổng phát sinh (bao gồm ADMIN)
+		"f1CommissionGross":     f1CommissionGross,
+		"systemCommissionGross": systemCommissionGross,
+	})
+}
 
 /* ===== MIDDLEWARE ===== */
 func authRequired() gin.HandlerFunc {
@@ -556,7 +729,121 @@ func topupHistoryHandler(c *gin.Context) {
 		Order("t.id DESC").Scan(&rows)
 	c.JSON(200, gin.H{"rows": rows})
 }
+func isInSubtree(ownerID, targetID uint) (bool, error) {
+	if ownerID == targetID {
+		return true, nil
+	}
+	ids := []uint{ownerID}
+	for d := 1; d <= 9; d++ {
+		var us []User
+		if err := DB.Where("referred_by IN ?", ids).Select("id").Find(&us).Error; err != nil {
+			return false, err
+		}
+		next := make([]uint, 0, len(us))
+		for _, u := range us {
+			if u.ID == targetID {
+				return true, nil
+			}
+			next = append(next, u.ID)
+		}
+		ids = next
+		if len(ids) == 0 {
+			break
+		}
+	}
+	return false, nil
+}
+func downlineDashboardHandler(c *gin.Context) {
+	ownerID := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+	targetID64, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+	targetID := uint(targetID64)
 
+	// bắt buộc nằm trong F1..F9 của owner
+	ok, err := isInSubtree(ownerID, targetID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Lỗi kiểm tra quyền xem"})
+		return
+	}
+	if !ok {
+		c.JSON(403, gin.H{"error": "Không có quyền xem người này"})
+		return
+	}
+
+	// tháng: YYYY-MM, mặc định tháng hiện tại
+	month := strings.TrimSpace(c.Query("month"))
+	now := time.Now()
+	if month == "" {
+		month = fmt.Sprintf("%04d-%02d", now.Year(), int(now.Month()))
+	}
+	// range time của tháng
+	firstDay, _ := time.Parse("2006-01", month)
+	nextMonth := firstDay.AddDate(0, 1, 0)
+
+	// lấy user
+	var u User
+	if err := DB.Select("id, username, coins, bonus_coins, v_ip_level").
+		First(&u, targetID).Error; err != nil {
+		c.JSON(404, gin.H{"error": "User không tồn tại"})
+		return
+	}
+
+	// KPI
+	ov := DashboardOverview{}
+
+	// tổng tài sản = coins + bonusCoins (nếu không có bonusCoins thì để 0)
+	type tmp struct{ Coins, BonusCoins int64 }
+	var t tmp
+	_ = DB.Model(&User{}).Where("id=?", targetID).
+		Select("coins, IFNULL(bonus_coins,0) as bonus_coins").Scan(&t).Error
+	ov.TotalAssets = t.Coins + t.BonusCoins
+
+	// F1 count
+	DB.Model(&User{}).Where("referred_by = ?", targetID).Count(&ov.F1Count)
+
+	// Hoa hồng F1 & hệ thống (depth 1..9) đổ vào ví **đã được cộng khi phát sinh**,
+	// ở đây chỉ tính tổng để hiển thị.
+	DB.Model(&CommissionTxn{}).
+		Where("beneficiary_id = ? AND depth = 1", targetID).
+		Select("COALESCE(SUM(amount),0)").Scan(&ov.F1CommissionTotal)
+
+	DB.Model(&CommissionTxn{}).
+		Where("beneficiary_id = ? AND depth BETWEEN 1 AND 9", targetID).
+		Select("COALESCE(SUM(amount),0)").Scan(&ov.SystemCommissionTotal)
+
+	// Thu nhập theo ngày trong tháng (group by day)
+	type row struct {
+		D int
+		S int64
+	}
+	var rs []row
+	DB.Model(&CommissionTxn{}).
+		Where("beneficiary_id = ? AND created_at >= ? AND created_at < ?",
+			targetID, firstDay, nextMonth).
+		Select("DAY(created_at) AS d, COALESCE(SUM(amount),0) AS s").
+		Group("DAY(created_at)").Order("d").
+		Scan(&rs)
+
+	// build 1..last day
+	lastDay := time.Date(firstDay.Year(), firstDay.Month()+1, 0, 0, 0, 0, 0, time.Local).Day()
+	earn := make([]DayEarning, lastDay)
+	for i := 1; i <= lastDay; i++ {
+		earn[i-1] = DayEarning{Day: i, Amount: 0}
+	}
+	for _, r := range rs {
+		if r.D >= 1 && r.D <= lastDay {
+			earn[r.D-1].Amount = r.S
+		}
+	}
+
+	resp := DownlineDashboardResp{
+		UserID:   u.ID,
+		Username: u.Username,
+		Month:    month,
+		Overview: ov,
+		Earnings: earn,
+	}
+	c.JSON(200, resp)
+}
 func vipHistoryHandler(c *gin.Context) {
 	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
 	var rows []VipBuyRow
@@ -727,28 +1014,27 @@ func adminUserDetailHandler(c *gin.Context) {
 	}
 	c.JSON(200, gin.H{"user": out})
 }
-func moveToKycIfFromUploads(srcURL string, prefix string) (string, error) {
-	// chỉ nhận file đã ở /uploads (public) => chuyển sang KYC private
-	if !strings.HasPrefix(srcURL, "/uploads/") {
-		// vẫn chấp nhận nhưng không di chuyển (KHÔNG khuyến khích)
-		return "", fmt.Errorf("invalid source (not in /uploads)")
-	}
-	base := filepath.Base(srcURL)              // tên file
-	srcPath := filepath.Join(uploadsAbs, base) // đường dẫn thực tế trong uploads
-	if _, err := os.Stat(srcPath); err != nil {
-		return "", fmt.Errorf("source file not found")
-	}
 
-	// tạo tên mới an toàn trong KYC_DIR
-	ext := filepath.Ext(base)
-	newName := fmt.Sprintf("%s_%d%s", prefix, time.Now().UnixNano(), ext)
-	dstPath := filepath.Join(kycAbs, newName)
-
-	// di chuyển
-	if err := os.Rename(srcPath, dstPath); err != nil {
-		return "", fmt.Errorf("move failed: %w", err)
+// Trả true nếu viewerID là tổ tiên (F1..F9) của targetID
+func isAncestorWithin(tx *gorm.DB, viewerID, targetID uint, maxDepth int) (bool, error) {
+	cur := targetID
+	for d := 0; d < maxDepth; d++ {
+		var ref *uint
+		if err := tx.Model(&User{}).
+			Select("referred_by").
+			Where("id = ?", cur).
+			Take(&ref).Error; err != nil {
+			return false, err
+		}
+		if ref == nil || *ref == 0 {
+			return false, nil
+		}
+		if *ref == viewerID {
+			return true, nil
+		}
+		cur = *ref
 	}
-	return newName, nil // chỉ lưu filename (không phải đường dẫn)
+	return false, nil
 }
 
 func kycSubmitHandler(c *gin.Context) {
@@ -801,13 +1087,14 @@ func kycSubmitHandler(c *gin.Context) {
 			return err
 		}
 		updates := map[string]any{
-			"k_y_c_status":     "VERIFIED",
-			"k_y_c_full_name":  fullName,
-			"k_y_c_dob":        dob,
-			"k_y_c_number":     number,
-			"k_y_c_front_path": fFront,
-			"k_y_c_back_path":  fBack,
+			"kyc_status":     "VERIFIED",
+			"kyc_full_name":  fullName,
+			"kyc_dob":        dob,
+			"kyc_number":     number,
+			"kyc_front_path": fFront,
+			"kyc_back_path":  fBack,
 		}
+
 		return tx.Model(&u).Updates(updates).Error
 	}); err != nil {
 		c.JSON(500, gin.H{"error": "Cập nhật KYC thất bại"})
@@ -841,6 +1128,10 @@ func adminServeKyc(c *gin.Context, side string) {
 	p := filepath.Join(kycAbs, file)
 	c.File(p)
 }
+func init() {
+	mathrand.Seed(time.Now().UnixNano())
+}
+
 func adminServeKycFront(c *gin.Context) {
 	uid64, _ := strconv.ParseUint(c.Param("userId"), 10, 64)
 	uid := uint(uid64)
@@ -864,19 +1155,54 @@ func adminServeKycBack(c *gin.Context) {
 	path := filepath.Join(kycAbs, u.KYCBackPath)
 	c.File(path)
 }
+func collapseInventoryDuplicates() {
+	type Row struct {
+		UserID uint
+		Code   string
+		Total  int64
+		Cnt    int64
+	}
+	var dups []Row
+	DB.Model(&InventoryItem{}).
+		Select("user_id, code, SUM(qty) AS total, COUNT(*) AS cnt").
+		Group("user_id, code").
+		Having("COUNT(*) > 1").
+		Scan(&dups)
+
+	for _, r := range dups {
+		_ = DB.Transaction(func(tx *gorm.DB) error {
+			// xoá hết bản ghi trùng
+			if err := tx.Where("user_id=? AND code=?", r.UserID, r.Code).Delete(&InventoryItem{}).Error; err != nil {
+				return err
+			}
+			// tạo lại 1 dòng duy nhất với tổng Qty
+			return tx.Create(&InventoryItem{UserID: r.UserID, Code: r.Code, Qty: r.Total}).Error
+		})
+	}
+}
 
 /* ===== AUTH & PROFILE ===== */
 func registerHandler(c *gin.Context) {
-	var req RegisterRequest
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Ref      string `json:"ref"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
+
 	username := strings.ToLower(strings.TrimSpace(req.Username))
 	if username == "" {
 		c.JSON(400, gin.H{"error": "Thiếu username"})
 		return
 	}
+	if req.Password == "" {
+		c.JSON(400, gin.H{"error": "Thiếu mật khẩu"})
+		return
+	}
+
 	// chặn trùng username
 	var exists int64
 	_ = DB.Model(&User{}).Where("username = ?", username).Count(&exists)
@@ -904,30 +1230,38 @@ func registerHandler(c *gin.Context) {
 			}
 		}
 
-		displayName := strings.TrimSpace(req.Nickname)
-		if displayName == "" {
-			displayName = strings.TrimSpace(req.Name)
-		}
+		// chỉ lưu username + pass, còn name / phone để trống
 		u := User{
 			Username:     username,
-			Name:         displayName,
-			Phone:        strings.TrimSpace(req.Phone),
+			Name:         "",
+			Phone:        "",
 			PasswordHash: string(hash),
 			Role:         "user",
 			Coins:        0,
+			BonusCoins:   100, // tặng coin bonus
 			TotalTopup:   0,
 			VIPLevel:     0,
 			ReferralCode: &code,
 			ReferredBy:   referredBy,
+			FreeSpins:    10, // tặng lượt quay
 		}
 		if err := tx.Create(&u).Error; err != nil {
 			return fmt.Errorf("create user: %w", err)
 		}
+
+		// Gửi thông báo chào mừng
+		_ = tx.Create(&Notification{
+			UserID: u.ID,
+			Title:  "Chào mừng!",
+			Body:   "Bạn đã nhận được 100 coin bonus và 10 lượt quay miễn phí khi đăng ký.",
+		}).Error
+
 		return nil
 	}); err != nil {
 		c.JSON(500, gin.H{"error": "Không thể tạo người dùng"})
 		return
 	}
+
 	c.JSON(201, gin.H{"message": "Đăng ký thành công"})
 }
 
@@ -948,14 +1282,40 @@ func invAdd(tx *gorm.DB, userID uint, code string, qty int64) error {
 }
 
 func invSub(tx *gorm.DB, userID uint, code string, qty int64) error {
+	// Khóa hàng tồn
 	var it InventoryItem
-	if err := tx.Where("user_id=? AND code=?", userID, code).First(&it).Error; err != nil {
-		return fmt.Errorf("không có vật phẩm %s", code)
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("user_id = ? AND code = ?", userID, code).
+		First(&it).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("vật phẩm %s không đủ", code)
+		}
+		return err
 	}
 	if it.Qty < qty {
 		return fmt.Errorf("vật phẩm %s không đủ", code)
 	}
-	return tx.Model(&it).Update("qty", gorm.Expr("qty - ?", qty)).Error
+	// Trừ có điều kiện để tránh âm do race
+	return tx.Model(&InventoryItem{}).
+		Where("user_id = ? AND code = ? AND qty >= ?", userID, code, qty).
+		Update("qty", gorm.Expr("qty - ?", qty)).Error
+}
+
+func addToInventory(tx *gorm.DB, userID uint, code string, qty int64) error {
+	if qty == 0 {
+		return nil
+	}
+	return tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "user_id"}, {Name: "code"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"qty":        gorm.Expr("qty + ?", qty),
+			"updated_at": time.Now(),
+		}),
+	}).Create(&InventoryItem{
+		UserID: userID,
+		Code:   code,
+		Qty:    qty,
+	}).Error
 }
 
 // trả về: result:"COIN"|"DRAGON_BALL", code, amount, coins, inv(map)
@@ -967,84 +1327,164 @@ func chestOpenHandler(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "User không tồn tại"})
 		return
 	}
-	if user.Coins < CHEST_COST {
-		c.JSON(400, gin.H{"error": "Số dư không đủ (50 coin/ lần)"})
-		return
-	}
 
 	type result struct {
-		kind   string // "COIN" | "DRAGON_BALL"
-		code   string // "DB1".."DB7" nếu là DRAGON_BALL
-		amount int64  // 100/10 coin hoặc 1 viên
-	}
-
-	// Xác suất: 2% -> 100 coin, 3% -> Dragon Ball ngẫu nhiên, còn lại -> 10 coin
-	pick := func() result {
-		n, _ := rand.Int(rand.Reader, big.NewInt(10000)) // 0..9999
-		x := n.Int64()
-		switch {
-		case x < 200: // 2%
-			return result{"COIN", "", 100}
-		case x < 500: // +3% = 5% đầu
-			star := randInt(1, 7) // dùng helper global randInt(min,max)
-			return result{"DRAGON_BALL", fmt.Sprintf("DB%d", star), 1}
-		default:
-			return result{"COIN", "", 10}
-		}
+		Result               string         `json:"result"` // "DRAGON_BALL" | "EVENT_CARD"
+		Code                 *string        `json:"code,omitempty"`
+		Amount               int64          `json:"amount"` // số lượng item nhận được
+		Coins                int64          `json:"coins"`
+		BonusCoins           int64          `json:"bonusCoins"`
+		FreeSpins            int            `json:"freeSpins"`
+		Inv                  map[string]int `json:"inv"`
+		UsedFreeSpin         bool           `json:"used_free_spin,omitempty"`
+		RemainingFreeSpins   int            `json:"remaining_free_spins,omitempty"`
+		MilestoneRewarded    bool           `json:"milestoneRewarded,omitempty"`
+		MilestoneRewardCoins int64          `json:"milestoneRewardCoins,omitempty"`
+		ChestOpens           int64          `json:"chest_opens"`
+		RemainingUntilBonus  int64          `json:"remaining_until_bonus"`
 	}
 
 	var out result
+	out.Inv = map[string]int{}
+
+	const spinCost int64 = 50        // phí mở nếu không có freeSpin
+	const milestoneEvery int64 = 100 // mốc thưởng theo lượt mở
+	const milestoneReward int64 = 1000
+
 	if err := DB.Transaction(func(tx *gorm.DB) error {
-		// trừ phí mở
-		if err := tx.Model(&User{}).
-			Where("id = ?", user.ID).
-			Update("coins", gorm.Expr("coins - ?", CHEST_COST)).Error; err != nil {
+		// Khóa hàng user
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&user, uid).Error; err != nil {
 			return err
 		}
 
-		// bốc quà
-		out = pick()
-		if out.kind == "COIN" {
+		// ✅ CHẶT CHẼ: nếu không có freeSpins và tổng (bonus+coins) < spinCost → chặn luôn
+		if user.FreeSpins <= 0 && user.BonusCoins+user.Coins < spinCost {
+			return fmt.Errorf("Số dư không đủ")
+		}
+
+		// 1) Trừ freeSpins hoặc bonus/coins
+		usedFree := false
+		if user.FreeSpins > 0 {
 			if err := tx.Model(&User{}).
 				Where("id = ?", user.ID).
-				Update("coins", gorm.Expr("coins + ?", out.amount)).Error; err != nil {
+				Update("free_spins", gorm.Expr("free_spins - 1")).Error; err != nil {
 				return err
 			}
+			user.FreeSpins -= 1
+			usedFree = true
 		} else {
-			if err := invAdd(tx, user.ID, out.code, out.amount); err != nil {
+			// dùng bonus trước, còn thiếu trừ coins
+			if err := spendForSystem(tx, &user, spinCost); err != nil {
+				return err
+			}
+		}
+		out.UsedFreeSpin = usedFree
+
+		// 2) Random phần thưởng: 10% DB1..DB7, 90% thẻ sự kiện EV (1..5)
+		rewardKind := "EVENT_CARD"
+		var rewardCode string
+		var rewardAmt int64
+
+		r := mathrand.Intn(100) // 0..99
+		if r < 10 {
+			rewardKind = "DRAGON_BALL"
+			rewardCode = fmt.Sprintf("DB%d", 1+mathrand.Intn(7))
+			rewardAmt = 1
+		} else {
+			rewardKind = "EVENT_CARD"
+			rewardCode = "EV"
+			rewardAmt = int64(1 + mathrand.Intn(5)) // 1..5
+		}
+
+		// Cộng item vào túi
+		if err := addToInventory(tx, user.ID, rewardCode, rewardAmt); err != nil {
+			return err
+		}
+		out.Inv[rewardCode] += int(rewardAmt)
+
+		// 3) Log giao dịch mở rương
+		cost := int64(0)
+		if !usedFree {
+			cost = spinCost
+		}
+		if err := tx.Create(&ChestTxn{
+			UserID:       user.ID,
+			Cost:         cost,
+			RewardKind:   rewardKind,
+			RewardCode:   rewardCode,
+			RewardAmount: rewardAmt,
+		}).Error; err != nil {
+			return err
+		}
+
+		// 4) Tăng bộ đếm mở rương
+		if err := tx.Model(&User{}).
+			Where("id = ?", user.ID).
+			Update("chest_open_count", gorm.Expr("chest_open_count + 1")).Error; err != nil {
+			return fmt.Errorf("increase chest_open_count: %w", err)
+		}
+
+		// 5) Đọc lại coins/bonus/freeSpins/count
+		if err := tx.Select("coins, bonus_coins, free_spins, chest_open_count").
+			First(&user, user.ID).Error; err != nil {
+			return err
+		}
+
+		// 6) Thưởng mốc 100/200/...
+		count := int64(user.ChestOpenCount)
+		if count%milestoneEvery == 0 {
+			// (giữ nguyên cộng vào coins; nếu muốn cộng bonus, đổi tên cột ở đây)
+			if err := tx.Model(&User{}).
+				Where("id = ?", user.ID).
+				Update("coins", gorm.Expr("coins + ?", milestoneReward)).Error; err != nil {
+				return fmt.Errorf("milestone add coins: %w", err)
+			}
+			out.MilestoneRewarded = true
+			out.MilestoneRewardCoins = milestoneReward
+
+			_ = tx.Create(&Notification{
+				UserID: user.ID,
+				Title:  "Chúc mừng đạt mốc mở rương!",
+				Body:   fmt.Sprintf("Bạn đạt %d lượt mở rương và nhận %d coin thưởng.", user.ChestOpenCount, milestoneReward),
+			}).Error
+
+			// reload coins
+			if err := tx.Select("coins").First(&user, user.ID).Error; err != nil {
 				return err
 			}
 		}
 
-		// log
-		return tx.Create(&ChestTxn{
-			UserID:       user.ID,
-			Cost:         CHEST_COST,
-			RewardKind:   out.kind,
-			RewardCode:   out.code,
-			RewardAmount: out.amount,
-		}).Error
+		// 7) Còn bao nhiêu lượt tới mốc
+		remaining := milestoneEvery - (int64(user.ChestOpenCount) % milestoneEvery)
+		if remaining == 0 {
+			remaining = milestoneEvery
+		}
+
+		// 8) Gán output
+		out.Result = rewardKind
+		if rewardKind == "DRAGON_BALL" {
+			out.Code = &rewardCode
+		}
+		out.Amount = rewardAmt
+		out.Coins = user.Coins
+		out.BonusCoins = user.BonusCoins
+		out.FreeSpins = user.FreeSpins
+		out.RemainingFreeSpins = user.FreeSpins
+		out.ChestOpens = int64(user.ChestOpenCount)
+		out.RemainingUntilBonus = remaining
+
+		return nil
 	}); err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "Số dư không đủ") {
+			c.JSON(400, gin.H{"error": msg})
+			return
+		}
 		c.JSON(500, gin.H{"error": "Mở rương thất bại"})
 		return
 	}
 
-	// coins & túi đồ hiện tại
-	DB.Select("coins").First(&user, user.ID)
-	inv := map[string]int64{}
-	var items []InventoryItem
-	DB.Where("user_id = ?", user.ID).Find(&items)
-	for _, it := range items {
-		inv[it.Code] = it.Qty
-	}
-
-	c.JSON(200, gin.H{
-		"result": out.kind,
-		"code":   out.code,
-		"amount": out.amount,
-		"coins":  user.Coins,
-		"inv":    inv,
-	})
+	c.JSON(200, out)
 }
 
 func inventoryHandler(c *gin.Context) {
@@ -1094,28 +1534,77 @@ func mergeDragonBallsHandler(c *gin.Context) {
 // POST /private/market/list  { code:"DB1", qty:1, pricePerUnit:500 }
 func marketListHandler(c *gin.Context) {
 	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+
+	// Request body
 	var req struct {
 		Code         string `json:"code"`
 		Qty          int64  `json:"qty"`
 		PricePerUnit int64  `json:"pricePerUnit"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.Qty <= 0 || req.PricePerUnit <= 0 {
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": "Dữ liệu không hợp lệ"})
 		return
 	}
 	req.Code = strings.ToUpper(strings.TrimSpace(req.Code))
+	if req.Code == "" || req.Qty <= 0 || req.PricePerUnit <= 0 {
+		c.JSON(400, gin.H{"error": "Dữ liệu không hợp lệ"})
+		return
+	}
+
+	// ✅ Chỉ cho phép DB1..DB7 hoặc EV
+	isDB := strings.HasPrefix(req.Code, "DB") && len(req.Code) == 3 && req.Code[2] >= '1' && req.Code[2] <= '7'
+	isEV := req.Code == "EV"
+	if !(isDB || isEV) {
+		c.JSON(400, gin.H{"error": "Mã vật phẩm không hợp lệ (chỉ DB1..DB7 hoặc EV)"})
+		return
+	}
 
 	if err := DB.Transaction(func(tx *gorm.DB) error {
-		if err := invSub(tx, uid, req.Code, req.Qty); err != nil {
+		// 🔒 Khoá row inventory của user+code để chống race
+		var inv InventoryItem
+		if err := tx.
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("user_id = ? AND code = ?", uid, req.Code).
+			First(&inv).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("vật phẩm %s không đủ (còn 0)", req.Code)
+			}
 			return err
 		}
-		return tx.Create(&MarketListing{
-			SellerID: uid, Code: req.Code, Qty: req.Qty, PricePerUnit: req.PricePerUnit, IsActive: true,
-		}).Error
+
+		if inv.Qty < req.Qty {
+			return fmt.Errorf("vật phẩm %s không đủ (còn %d)", req.Code, inv.Qty)
+		}
+
+		// ✅ Trừ tồn kho an toàn (điều kiện qty >= req.Qty ngay trong SQL)
+		res := tx.Model(&InventoryItem{}).
+			Where("user_id = ? AND code = ? AND qty >= ?", uid, req.Code, req.Qty).
+			Update("qty", gorm.Expr("qty - ?", req.Qty))
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			// Ai đó vừa trừ mất trong race khác
+			return fmt.Errorf("vật phẩm %s không đủ", req.Code)
+		}
+
+		// Tạo listing
+		ml := MarketListing{
+			SellerID:     uid,
+			Code:         req.Code,
+			Qty:          req.Qty,
+			PricePerUnit: req.PricePerUnit,
+			IsActive:     true,
+		}
+		if err := tx.Create(&ml).Error; err != nil {
+			return err
+		}
+		return nil
 	}); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
+
 	c.JSON(200, gin.H{"message": "Đã đăng bán"})
 }
 
@@ -1142,6 +1631,321 @@ func marketQueryHandler(c *gin.Context) {
 		Select("market_listings.id, market_listings.code, market_listings.qty, market_listings.price_per_unit, u.id as seller_id, u.username as seller_email").
 		Scan(&rows)
 	c.JSON(200, gin.H{"rows": rows})
+}
+
+// Trừ amount cho các tác vụ hệ thống: ưu tiên BonusCoins rồi mới Coins
+func spendForSystem(tx *gorm.DB, u *User, amount int64) error {
+	if amount <= 0 {
+		return nil
+	}
+	if u.BonusCoins+u.Coins < amount {
+		return fmt.Errorf("Số dư không đủ")
+	}
+	useBonus := u.BonusCoins
+	if useBonus > amount {
+		useBonus = amount
+	}
+	left := amount - useBonus
+
+	if err := tx.Model(&User{}).Where("id = ?", u.ID).Updates(map[string]any{
+		"bonus_coins": gorm.Expr("bonus_coins - ?", useBonus),
+		"coins":       gorm.Expr("coins - ?", left),
+	}).Error; err != nil {
+		return err
+	}
+	u.BonusCoins -= useBonus
+	u.Coins -= left
+	return nil
+}
+
+// gen 12 ký tự A-Za-z0-9
+func genPromoCode(n int) string {
+	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		k, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		b[i] = letters[k.Int64()]
+	}
+	return string(b)
+}
+func cleanupExpiredPromoCodes() {
+	now := time.Now()
+
+	// 1) set inactive nếu hết hạn hoặc dùng hết
+	_ = DB.Model(&PromoCode{}).
+		Where("(expires_at IS NOT NULL AND expires_at <= ?) OR (max_uses IS NOT NULL AND used_count >= max_uses)", now).
+		Update("is_active", false).Error
+
+	// 2) xoá cứng các code inactive để danh sách gọn (nếu muốn chỉ ẩn, bỏ phần Delete này)
+	_ = DB.Where("is_active = 0").Delete(&PromoCode{}).Error
+}
+
+type createCodeReq struct {
+	FreeSpins int `json:"freeSpins"` // mặc định 10
+}
+type createCodeRes struct {
+	Code      string `json:"code"`
+	FreeSpins int    `json:"freeSpins"`
+}
+
+func myNotificationsHandler(c *gin.Context) {
+	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+	unreadOnly := strings.TrimSpace(c.Query("unreadOnly")) == "1"
+
+	type Row struct {
+		ID        uint      `json:"id"`
+		Title     string    `json:"title"`
+		Body      string    `json:"body"`
+		IsRead    bool      `json:"isRead"`
+		CreatedAt time.Time `json:"createdAt"`
+	}
+
+	q := DB.Model(&Notification{}).Where("user_id = ?", uid)
+	if unreadOnly {
+		q = q.Where("is_read = 0")
+	}
+
+	var rows []Row
+	q.Order("id DESC").Scan(&rows)
+
+	var unread int64
+	DB.Model(&Notification{}).Where("user_id = ? AND is_read = 0", uid).Count(&unread)
+
+	c.JSON(200, gin.H{"rows": rows, "unread": unread})
+}
+
+func markMyNotificationsReadHandler(c *gin.Context) {
+	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+	if err := DB.Model(&Notification{}).
+		Where("user_id = ? AND is_read = 0", uid).
+		Update("is_read", true).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Cập nhật thất bại"})
+		return
+	}
+	c.JSON(200, gin.H{"message": "Đã đánh dấu đã đọc"})
+}
+func genPromoString(n int) string {
+	const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		k, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+		b[i] = letters[k.Int64()]
+	}
+	return string(b)
+}
+
+type CreatePromoReq struct {
+	RewardFreeSpin int  `json:"rewardFreeSpin"`          // mặc định 10
+	DurationHours  *int `json:"durationHours,omitempty"` // chỉ áp dụng với UNLIMITED (nil => 24h)
+	MaxUses        *int `json:"maxUses,omitempty"`       // nil => vô hạn; =1 => one-use
+	Count          int  `json:"count"`                   // số code muốn tạo (mặc định 1). Với one-use có thể 10/50/100/500
+}
+
+// POST /admin/promo-codes
+func adminCreatePromoCodeHandler(c *gin.Context) {
+	// Yêu cầu adminRequired() đã gắn ở router
+	claims := c.MustGet("claims").(jwt.MapClaims)
+	adminID := uint(claims["sub"].(float64))
+
+	var req CreatePromoReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": "Dữ liệu không hợp lệ"})
+		return
+	}
+
+	// Mặc định
+	if req.RewardFreeSpin <= 0 {
+		req.RewardFreeSpin = 10
+	}
+	// Count: mặc định 1, chặn quá lớn để an toàn
+	if req.Count <= 0 {
+		req.Count = 1
+	}
+	if req.Count > 1000 {
+		req.Count = 1000
+	}
+
+	// Phân loại theo MaxUses & DurationHours:
+	// - ONE-USE vô hạn: MaxUses=1, ExpiresAt = NULL
+	// - UNLIMITED có hạn: MaxUses=nil, ExpiresAt = now + duration (mặc định 24h)
+	var expiresAt *time.Time
+	if req.MaxUses == nil {
+		// unlimited uses
+		dh := 24
+		if req.DurationHours != nil && *req.DurationHours > 0 {
+			dh = *req.DurationHours
+		}
+		t := time.Now().UTC().Add(time.Duration(dh) * time.Hour)
+		expiresAt = &t
+	} else {
+		// có MaxUses: nếu =1 và muốn vô thời hạn -> expiresAt = nil
+		if *req.MaxUses < 1 {
+			c.JSON(400, gin.H{"error": "MaxUses phải >= 1 hoặc bỏ trống để vô hạn"})
+			return
+		}
+		expiresAt = nil
+	}
+
+	type Out struct {
+		Codes []string `json:"codes"`
+	}
+	out := Out{Codes: make([]string, 0, req.Count)}
+
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		for i := 0; i < req.Count; i++ {
+			code, err := randCode(12)
+			if err != nil {
+				return fmt.Errorf("gen code: %w", err)
+			}
+			pc := PromoCode{
+				Code:           code,
+				RewardFreeSpin: req.RewardFreeSpin,
+				MaxUses:        req.MaxUses, // nil => vô hạn; 1 => one-use
+				UsedCount:      0,
+				ExpiresAt:      expiresAt, // nil => vô thời hạn
+				IsActive:       true,
+				CreatedBy:      &adminID,
+			}
+			if err := tx.Create(&pc).Error; err != nil {
+				// tránh đụng unique, nếu trùng thì thử lại một ít lần
+				if strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+					i--
+					continue
+				}
+				return err
+			}
+			out.Codes = append(out.Codes, pc.Code)
+		}
+		return nil
+	})
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Không tạo được code: " + err.Error()})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"message":        "Đã tạo gift code",
+		"rewardFreeSpin": req.RewardFreeSpin,
+		"maxUses":        req.MaxUses, // nil hoặc 1
+		"expiresAt":      expiresAt,   // null nếu vô hạn
+		"count":          len(out.Codes),
+		"codes":          out.Codes, // trả về danh sách code đã tạo
+	})
+}
+
+// GET /admin/promo-codes
+func adminListActivePromoCodesHandler(c *gin.Context) {
+	nowUTC := time.Now().UTC()
+
+	var pcs []PromoCode
+	if err := DB.
+		Where("is_active = ? AND (expires_at IS NULL OR expires_at > ?)", true, nowUTC).
+		Order("expires_at ASC, created_at DESC").
+		Limit(100).
+		Find(&pcs).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Không lấy được danh sách code"})
+		return
+	}
+
+	// map thành định dạng frontend đang dùng (code/value/expiresAt/createdAt)
+	type Row struct {
+		ID        uint       `json:"id"`
+		Code      string     `json:"code"`
+		Value     int        `json:"value"` // = RewardFreeSpin
+		ExpiresAt *time.Time `json:"expiresAt"`
+		CreatedAt time.Time  `json:"createdAt"`
+	}
+	out := make([]Row, 0, len(pcs))
+	for _, p := range pcs {
+		out = append(out, Row{
+			ID:        p.ID,
+			Code:      p.Code,
+			Value:     p.RewardFreeSpin,
+			ExpiresAt: p.ExpiresAt,
+			CreatedAt: p.CreatedAt,
+		})
+	}
+
+	c.JSON(200, gin.H{"rows": out})
+}
+
+func redeemCodeHandler(c *gin.Context) {
+	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+	var req RedeemReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	var outFreeSpins int
+
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		// lock code
+		var pc PromoCode
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("code = ? AND is_active = 1", req.Code).
+			First(&pc).Error; err != nil {
+			return fmt.Errorf("Code không tồn tại hoặc đã bị vô hiệu")
+		}
+
+		// còn hạn?
+		if pc.ExpiresAt != nil && time.Now().After(*pc.ExpiresAt) {
+			return fmt.Errorf("Code đã hết hạn")
+		}
+
+		// còn lượt dùng? (nil => vô hạn)
+		if pc.MaxUses != nil && pc.UsedCount >= *pc.MaxUses {
+			return fmt.Errorf("Code đã dùng hết")
+		}
+
+		// chặn user dùng lặp
+		// unique (promo_code_id, user_id)
+		use := PromoCodeUse{PromoCodeID: pc.ID, UserID: uid}
+		if err := tx.Create(&use).Error; err != nil {
+			// duplicate
+			if strings.Contains(strings.ToLower(err.Error()), "unique") {
+				return fmt.Errorf("Bạn đã nhập code này rồi")
+			}
+			return err
+		}
+
+		// cộng free spins cho user
+		if err := tx.Model(&User{}).
+			Where("id = ?", uid).
+			Update("free_spins", gorm.Expr("free_spins + ?", pc.RewardFreeSpin)).Error; err != nil {
+			return err
+		}
+
+		// tăng UsedCount
+		if err := tx.Model(&pc).Update("used_count", gorm.Expr("used_count + 1")).Error; err != nil {
+			return err
+		}
+
+		// đọc lại để trả về số free_spins hiện tại
+		var u User
+		if err := tx.Select("free_spins").First(&u, uid).Error; err != nil {
+			return err
+		}
+		outFreeSpins = int(u.FreeSpins)
+
+		// tạo notification cho user
+		note := Notification{
+			UserID: uid,
+			Title:  "Nhận quà gift code",
+			Body:   fmt.Sprintf("Bạn được +%d lượt quay miễn phí (code %s).", pc.RewardFreeSpin, pc.Code),
+		}
+		_ = tx.Create(&note).Error
+
+		return nil
+	}); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"message":   "Nhập code thành công",
+		"freeSpins": outFreeSpins,
+	})
 }
 
 // POST /private/market/buy { listingId, qty }
@@ -1180,8 +1984,12 @@ func marketBuyHandler(c *gin.Context) {
 		}
 
 		total := req.Qty * l.PricePerUnit
-		if buyer.Coins < total {
+		if buyer.Coins+buyer.BonusCoins < total {
 			return fmt.Errorf("Số dư không đủ")
+		}
+		// trừ tiền hệ thống ở phía người mua (ưu tiên bonus)
+		if err := spendForSystem(tx, &buyer, total); err != nil {
+			return err
 		}
 
 		// trừ người mua, cộng người bán
@@ -1407,15 +2215,32 @@ func getVipTiersHandler(c *gin.Context) {
 
 func getWalletHandler(c *gin.Context) {
 	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+
 	var user User
 	if err := DB.First(&user, uid).Error; err != nil {
-		c.JSON(404, gin.H{"error": "User không tồn tại"})
+		// Trả 401 để FE tự logout
+		c.JSON(401, gin.H{"error": "UNAUTHORIZED"})
 		return
 	}
+
+	// ĐỂ NGUYÊN là hằng số “untyped”, tránh mismatch % giữa int và int64
+	const milestoneEvery = 100
+
+	// Go sẽ tự dùng cùng kiểu với ChestOpenCount cho phép toán %
+	rem := milestoneEvery - (user.ChestOpenCount % milestoneEvery)
+	if rem == 0 {
+		rem = milestoneEvery
+	}
+	totalCoins := user.Coins + user.BonusCoins
 	c.JSON(200, gin.H{
-		"coins":      user.Coins,
-		"totalTopup": user.TotalTopup,
-		"vipLevel":   user.VIPLevel,
+		"coins":               user.Coins,
+		"totalTopup":          user.TotalTopup,
+		"vipLevel":            user.VIPLevel,
+		"freeSpins":           user.FreeSpins,
+		"chestOpens":          user.ChestOpenCount, // giữ nguyên kiểu của field
+		"remainingUntilBonus": rem,                 // cùng kiểu với rem ở trên
+		"bonusCoins":          user.BonusCoins,
+		"totalCoins":          totalCoins,
 	})
 }
 
@@ -1553,27 +2378,56 @@ func adminHardDeleteUserHandler(c *gin.Context) {
 	}
 
 	if err := DB.Transaction(func(tx *gorm.DB) error {
-		// dọn tham chiếu/upline để tránh lỗi FK
+		// 1) clear tham chiếu/upline để tránh FK
 		if err := tx.Model(&User{}).Where("referred_by = ?", uid).Update("referred_by", nil).Error; err != nil {
 			return fmt.Errorf("clear referred_by: %w", err)
 		}
-		// xóa các lịch sử liên quan
+
+		// 2) dọn dữ liệu liên quan tới user ở mọi bảng
+		// lịch sử giao dịch coin/chuyển
 		if err := tx.Where("from_id = ? OR to_id = ?", uid, uid).Delete(&TransferTxn{}).Error; err != nil {
 			return fmt.Errorf("del transfer_txns: %w", err)
 		}
 		if err := tx.Where("user_id = ? OR admin_id = ?", uid, uid).Delete(&CoinTxn{}).Error; err != nil {
 			return fmt.Errorf("del coin_txns: %w", err)
 		}
-		if err := tx.Where("inviter_id = ? OR invitee_id = ?", uid, uid).Delete(&ReferralReward{}).Error; err != nil {
-			return fmt.Errorf("del referral_rewards: %w", err)
-		}
+		// mua VIP, hoa hồng
 		if err := tx.Where("user_id = ?", uid).Delete(&VipPurchaseTxn{}).Error; err != nil {
 			return fmt.Errorf("del vip_purchase_txns: %w", err)
 		}
 		if err := tx.Where("buyer_id = ? OR beneficiary_id = ?", uid, uid).Delete(&CommissionTxn{}).Error; err != nil {
 			return fmt.Errorf("del commission_txns: %w", err)
 		}
-		// ❗ xóa cứng user
+		// rút coin
+		if err := tx.Where("user_id = ? OR admin_id = ?", uid, uid).Delete(&WithdrawTxn{}).Error; err != nil {
+			return fmt.Errorf("del withdraw_txns: %w", err)
+		}
+		// referral one-off
+		if err := tx.Where("inviter_id = ? OR invitee_id = ?", uid, uid).Delete(&ReferralReward{}).Error; err != nil {
+			return fmt.Errorf("del referral_rewards: %w", err)
+		}
+		// túi đồ, log mở rương, thông báo
+		if err := tx.Where("user_id = ?", uid).Delete(&InventoryItem{}).Error; err != nil {
+			return fmt.Errorf("del inventory_items: %w", err)
+		}
+		if err := tx.Where("user_id = ?", uid).Delete(&ChestTxn{}).Error; err != nil {
+			return fmt.Errorf("del chest_txns: %w", err)
+		}
+		if err := tx.Where("user_id = ?", uid).Delete(&Notification{}).Error; err != nil {
+			return fmt.Errorf("del notifications: %w", err)
+		}
+		// promo code uses (nếu có)
+		if err := tx.Where("user_id = ?", uid).Delete(&PromoCodeUse{}).Error; err != nil {
+			// bảng này có thể rỗng; vẫn nên trả lỗi rõ ràng nếu có
+			return fmt.Errorf("del promo_code_uses: %w", err)
+		}
+		// chợ: rút & xoá listing còn lại
+		// (chỉ cần delete; nếu muốn trả vật phẩm thì đã xoá inventory rồi)
+		if err := tx.Where("seller_id = ?", uid).Delete(&MarketListing{}).Error; err != nil {
+			return fmt.Errorf("del market_listings: %w", err)
+		}
+
+		// 3) xoá cứng user
 		if err := tx.Unscoped().Delete(&User{}, uid).Error; err != nil {
 			return fmt.Errorf("del user: %w", err)
 		}
@@ -1582,6 +2436,14 @@ func adminHardDeleteUserHandler(c *gin.Context) {
 		log.Println("admin hard delete error:", err)
 		c.JSON(500, gin.H{"error": "Xoá tài khoản thất bại"})
 		return
+	}
+
+	// 4) (tuỳ chọn) xoá file KYC trên đĩa sau khi TX thành công
+	if u.KYCFrontPath != "" {
+		_ = os.Remove(filepath.Join(kycAbs, u.KYCFrontPath))
+	}
+	if u.KYCBackPath != "" {
+		_ = os.Remove(filepath.Join(kycAbs, u.KYCBackPath))
 	}
 
 	c.Status(204)
@@ -1604,6 +2466,8 @@ func buyVipHandler(c *gin.Context) {
 		price = t.MinTopup
 	}
 
+	const vipInviteMilestoneReward int64 = 500 // thưởng mốc cho F1 khi đạt 10 direct VIP (chỉ 1 lần)
+
 	if user.VIPLevel >= 1 {
 		c.JSON(400, gin.H{"error": "Bạn đã là VIP"})
 		return
@@ -1614,24 +2478,38 @@ func buyVipHandler(c *gin.Context) {
 	}
 
 	if err := DB.Transaction(func(tx *gorm.DB) error {
-		// trừ coin & set VIP = 1
-		if err := tx.Model(&User{}).Where("id = ?", user.ID).Update("coins", gorm.Expr("coins - ?", price)).Error; err != nil {
+		// 1) Trừ coin & set VIP = 1
+		if err := tx.Model(&User{}).Where("id = ?", user.ID).
+			Update("coins", gorm.Expr("coins - ?", price)).Error; err != nil {
 			return err
 		}
 		old := user.VIPLevel
-		if err := tx.Model(&User{}).Where("id = ?", user.ID).Update("VIPLevel", 1).Error; err != nil {
+		if err := tx.Model(&User{}).Where("id = ?", user.ID).
+			Update("v_ip_level", 1).Error; err != nil {
 			return err
 		}
-		if err := tx.Create(&VipPurchaseTxn{UserID: user.ID, Level: 1, Price: price, OldLevel: old}).Error; err != nil {
+		if err := tx.Create(&VipPurchaseTxn{
+			UserID: user.ID, Level: 1, Price: price, OldLevel: old,
+		}).Error; err != nil {
 			return err
 		}
 
-		// chia hoa hồng 9 tầng, mỗi tầng 10%
+		// 2) Tặng 10 lượt quay miễn phí cho NGƯỜI MUA (giữ nguyên)
+		if err := tx.Model(&User{}).
+			Where("id = ?", user.ID).
+			Update("free_spins", gorm.Expr("free_spins + ?", 10)).Error; err != nil {
+			return fmt.Errorf("award buyer free spins: %w", err)
+		}
+
+		// 3) Chia hoa hồng 9 tầng, mỗi tầng 10% — CHỈ trả cho upline đã VIP
 		uplines, _ := getUplines(tx, user.ReferredBy, 9)
 		allocated := 0
 		for i, up := range uplines {
 			if allocated >= 100 {
 				break
+			}
+			if up.VIPLevel < 1 {
+				continue
 			}
 			pct := 10
 			if left := 100 - allocated; pct > left {
@@ -1639,7 +2517,8 @@ func buyVipHandler(c *gin.Context) {
 			}
 			amt := (price * int64(pct)) / 100
 			if amt > 0 {
-				if err := tx.Model(&User{}).Where("id = ?", up.ID).Update("coins", gorm.Expr("coins + ?", amt)).Error; err != nil {
+				if err := tx.Model(&User{}).Where("id = ?", up.ID).
+					Update("coins", gorm.Expr("coins + ?", amt)).Error; err != nil {
 					return fmt.Errorf("upline depth %d: %w", i+1, err)
 				}
 				if err := tx.Create(&CommissionTxn{
@@ -1652,7 +2531,43 @@ func buyVipHandler(c *gin.Context) {
 			allocated += pct
 		}
 
-		// phần còn lại (nếu còn) -> log cho admin (không cộng coin admin)
+		// 4) Thưởng mốc cho F1: CHỈ 1 LẦN khi đạt 10 direct VIP
+		if user.ReferredBy != nil && *user.ReferredBy != 0 {
+			// lock hàng F1 để đọc/ghi cờ an toàn
+			var f1 User
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Select("id, coins, invite10_vip_bonus_paid").
+				First(&f1, *user.ReferredBy).Error; err == nil {
+
+				// Đếm số F1 đã VIP (đã bao gồm user hiện tại vì ở trên set VIP xong)
+				var directVipCount int64
+				if err := tx.Model(&User{}).
+					Where("referred_by = ? AND v_ip_level >= 1", f1.ID).
+					Count(&directVipCount).Error; err == nil {
+
+					// Nếu vừa đạt 10 và CHƯA trả thưởng trước đó -> thưởng & set cờ
+					if directVipCount >= 10 && !f1.Invite10VipBonusPaid {
+						if err := tx.Model(&User{}).
+							Where("id = ?", f1.ID).
+							Update("coins", gorm.Expr("coins + ?", vipInviteMilestoneReward)).Error; err != nil {
+							return fmt.Errorf("award F1 milestone: %w", err)
+						}
+						if err := tx.Model(&User{}).
+							Where("id = ?", f1.ID).
+							Update("invite10_vip_bonus_paid", true).Error; err != nil {
+							return fmt.Errorf("mark F1 milestone paid: %w", err)
+						}
+						_ = tx.Create(&Notification{
+							UserID: f1.ID,
+							Title:  "Thưởng mốc mời bạn VIP",
+							Body:   fmt.Sprintf("Bạn đã có 10 người mua VIP trực tiếp. Thưởng +%d coin.", vipInviteMilestoneReward),
+						}).Error
+					}
+				}
+			}
+		}
+
+		// 5) Phần còn lại (nếu còn) -> log cho admin
 		if allocated < 100 {
 			if admin, err := getAnyAdmin(tx); err == nil {
 				rem := 100 - allocated
@@ -1677,6 +2592,53 @@ func buyVipHandler(c *gin.Context) {
 
 	DB.First(&user, user.ID)
 	c.JSON(200, gin.H{"message": "Mua VIP thành công", "level": user.VIPLevel, "coins": user.Coins})
+}
+
+// GET /private/notifications?unreadOnly=1
+func listNotificationsHandler(c *gin.Context) {
+	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+	unreadOnly := c.Query("unreadOnly") == "1"
+
+	q := DB.Where("user_id = ?", uid).Order("id DESC").Limit(50)
+	if unreadOnly {
+		q = q.Where("is_read = 0")
+	}
+
+	var rows []Notification
+	if err := q.Find(&rows).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Không lấy được thông báo"})
+		return
+	}
+
+	var unread int64
+	DB.Model(&Notification{}).Where("user_id = ? AND is_read = 0", uid).Count(&unread)
+
+	c.JSON(200, gin.H{
+		"rows":   rows,
+		"unread": unread,
+	})
+}
+
+// PUT /private/notifications/mark-read  { ids?: number[] }
+// Nếu không gửi ids → mark read tất cả
+func markReadNotificationsHandler(c *gin.Context) {
+	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+	var req struct {
+		IDs []uint `json:"ids"`
+	}
+
+	_ = c.ShouldBindJSON(&req) // optional
+
+	q := DB.Model(&Notification{}).Where("user_id = ?", uid).Where("is_read = 0")
+	if len(req.IDs) > 0 {
+		q = q.Where("id IN ?", req.IDs)
+	}
+	if err := q.Update("is_read", true).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Không thể cập nhật thông báo"})
+		return
+	}
+
+	c.Status(204)
 }
 
 // POST /private/transfer  { toEmail, amount, note }
@@ -1754,30 +2716,32 @@ func transferHandler(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "Chuyển coin thành công", "fee": fee, "debit": totalDebit})
 }
 
+type kycUpdateReq struct {
+	FullName string `json:"fullName"` // đổi key để khớp FE
+	IdNumber string `json:"idNumber"`
+	Dob      string `json:"issueDate"` // hoặc "dob" nếu muốn
+}
+
 func updateKycHandler(c *gin.Context) {
 	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
 
+	// FE gửi nickname + idNumber
+	type kycUpdateReq struct {
+		Nickname string `json:"nickname"`
+		IdNumber string `json:"idNumber"`
+	}
 	var req kycUpdateReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Lấy filename an toàn (chỉ lưu tên file, không lưu URL đầy đủ)
-	front := strings.TrimSpace(req.FrontURL)
-	back := strings.TrimSpace(req.BackURL)
-	if front == "" && req.FrontPath != "" {
-		front = req.FrontPath
-	}
-	if back == "" && req.BackPath != "" {
-		back = req.BackPath
-	}
-	if front == "" || back == "" {
-		c.JSON(400, gin.H{"error": "Thiếu ảnh mặt trước hoặc mặt sau"})
+	name := strings.TrimSpace(req.Nickname)
+	num := strings.TrimSpace(req.IdNumber)
+	if name == "" || num == "" {
+		c.JSON(400, gin.H{"error": "Thiếu họ tên hoặc số CCCD"})
 		return
 	}
-	frontFile := filepath.Base(front)
-	backFile := filepath.Base(back)
 
 	var u User
 	if err := DB.First(&u, uid).Error; err != nil {
@@ -1785,18 +2749,19 @@ func updateKycHandler(c *gin.Context) {
 		return
 	}
 
-	// ✅ Auto-approve: lưu file + set APPROVED ngay
-	if err := DB.Model(&u).Updates(map[string]any{
-		"kyc_front_path": frontFile,
-		"kyc_back_path":  backFile,
-		"kyc_status":     "APPROVED",
-	}).Error; err != nil {
+	// Lưu vào các cột KYC hiện có (không đổi schema)
+	up := map[string]any{
+		"kyc_full_name": name, // nhận nickname nhưng lưu vào full_name
+		"kyc_number":    num,
+		"kyc_status":    "VERIFIED", // khớp enum('NONE','VERIFIED')
+	}
+	if err := DB.Model(&u).Updates(up).Error; err != nil {
 		c.JSON(500, gin.H{"error": "Cập nhật KYC thất bại"})
 		return
 	}
-
-	c.JSON(200, gin.H{"message": "Đã xác minh KYC (tự động phê duyệt)"})
+	c.JSON(200, gin.H{"message": "Đã xác minh KYC"})
 }
+
 func adminGetKycImage(c *gin.Context) {
 	// GET /admin/kyc-file/:userId/:side  (side=front|back)
 	uidStr := c.Param("userId")
@@ -1849,9 +2814,189 @@ func referralInfoHandler(c *gin.Context) {
 	c.JSON(200, gin.H{"code": codeStr, "link": link, "count": cnt, "total": total})
 }
 
+// handlers_dashboard.go
+func dashboardOverviewHandler(c *gin.Context) {
+	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+
+	var out DashboardOverview
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		// 1) total assets
+		var u User
+		if err := tx.Select("coins, bonus_coins").First(&u, uid).Error; err != nil {
+			return err
+		}
+		out.TotalAssets = u.Coins + u.BonusCoins
+
+		// 2) F1 count
+		if err := tx.Model(&User{}).
+			Where("referred_by = ?", uid).
+			Count(&out.F1Count).Error; err != nil {
+			return err
+		}
+
+		// 3) F1 commission total (depth=1)
+		if err := tx.Model(&CommissionTxn{}).
+			Where("beneficiary_id = ? AND depth = 1", uid).
+			Select("COALESCE(SUM(amount),0)").Scan(&out.F1CommissionTotal).Error; err != nil {
+			return err
+		}
+
+		// 4) System commission total (depth 1..9)
+		if err := tx.Model(&CommissionTxn{}).
+			Where("beneficiary_id = ? AND depth BETWEEN 1 AND 9", uid).
+			Select("COALESCE(SUM(amount),0)").Scan(&out.SystemCommissionTotal).Error; err != nil {
+			return err
+		}
+
+		// 5) System count (F1..F9)
+		// MySQL 8+ dùng CTE đệ quy cho nhanh, nếu không dùng được thì duyệt vòng (kèm hàm getUplines/downlines).
+		type row struct{ Cnt int64 }
+		var r row
+		// depth tối đa 9
+		q := `
+            WITH RECURSIVE downline AS (
+                SELECT id, referred_by, 1 AS depth FROM users WHERE referred_by = ?
+                UNION ALL
+                SELECT u.id, u.referred_by, d.depth+1
+                FROM users u JOIN downline d ON u.referred_by = d.id
+                WHERE d.depth < 9
+            )
+            SELECT COUNT(*) AS cnt FROM downline;
+        `
+		if err := tx.Raw(q, uid).Scan(&r).Error; err != nil {
+			// fallback không CTE: đếm tầng bằng vòng lặp (tuỳ DB của bạn)
+			// return err
+			out.SystemCount = 0 // tối thiểu có giá trị
+		} else {
+			out.SystemCount = r.Cnt
+		}
+		return nil
+	}); err != nil {
+		c.JSON(500, gin.H{"error": "Lấy tổng quan thất bại"})
+		return
+	}
+	c.JSON(200, out)
+}
+func myDownlinesHandler(c *gin.Context) {
+	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+
+	// optional ?depth=1..9 (0 or empty = all)
+	var depth int
+	if v := strings.TrimSpace(c.Query("depth")); v != "" {
+		if n, _ := strconv.Atoi(v); n >= 1 && n <= 9 {
+			depth = n
+		}
+	}
+
+	rows := make([]DownlineRow, 0, 32)
+
+	// Lấy F1..F9 theo vòng lặp (đơn giản, dễ hiểu)
+	currentLevel := []uint{uid}
+	for d := 1; d <= 9; d++ {
+		// nếu filter depth và khác level đang xét -> bỏ qua query
+		if depth != 0 && depth != d {
+			// nhưng vẫn phải build currentLevel mới cho vòng sau
+			var tmpUsers []User
+			if len(currentLevel) > 0 {
+				_ = DB.Where("referred_by IN ?", currentLevel).Select("id").Find(&tmpUsers).Error
+			}
+			next := make([]uint, 0, len(tmpUsers))
+			for _, u := range tmpUsers {
+				next = append(next, u.ID)
+			}
+			currentLevel = next
+			continue
+		}
+
+		var users []User
+		if len(currentLevel) > 0 {
+			if err := DB.
+				Where("referred_by IN ?", currentLevel).
+				Select("id, username, v_ip_level as vip_level, created_at").
+				Find(&users).Error; err != nil {
+				c.JSON(500, gin.H{"error": "Không tải được tuyến dưới"})
+				return
+			}
+		}
+
+		for _, u := range users {
+			rows = append(rows, DownlineRow{
+				ID:        u.ID,
+				Username:  u.Username,
+				Depth:     d,
+				VIPLevel:  u.VIPLevel,
+				CreatedAt: u.CreatedAt.Format(time.RFC3339),
+			})
+		}
+
+		// chuẩn bị danh sách id cho level tiếp theo
+		next := make([]uint, 0, len(users))
+		for _, u := range users {
+			next = append(next, u.ID)
+		}
+		currentLevel = next
+	}
+
+	c.JSON(200, gin.H{"rows": rows})
+}
+
+// handlers_dashboard.go
+func dashboardCommissionsHandler(c *gin.Context) {
+	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+
+	now := time.Now()
+	year, _ := strconv.Atoi(c.Query("year"))
+	month, _ := strconv.Atoi(c.Query("month"))
+	if year <= 0 {
+		year = now.Year()
+	}
+	if month <= 0 || month > 12 {
+		month = int(now.Month())
+	}
+
+	loc := time.Local
+	start := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, loc)
+	end := start.AddDate(0, 1, 0)
+
+	// gom theo ngày các giao dịch hoa hồng mà bạn là beneficiary (depth 1..9)
+	type row struct {
+		D int
+		S int64
+	}
+	var rows []row
+	if err := DB.Model(&CommissionTxn{}).
+		Where("beneficiary_id = ? AND created_at >= ? AND created_at < ? AND depth BETWEEN 1 AND 9", uid, start, end).
+		Select("DAY(created_at) as d, COALESCE(SUM(amount),0) as s").
+		Group("d").Order("d").
+		Scan(&rows).Error; err != nil {
+		c.JSON(500, gin.H{"error": "Lấy lịch hoa hồng thất bại"})
+		return
+	}
+
+	// build đủ ngày trong tháng
+	daysInMonth := time.Date(year, time.Month(month)+1, 0, 0, 0, 0, 0, loc).Day()
+	out := MonthlyCommissionResp{
+		Year:  year,
+		Month: month,
+		Days:  make([]DailyCommission, daysInMonth),
+	}
+	m := map[int]int64{}
+	var total int64 = 0
+	for _, r := range rows {
+		m[r.D] = r.S
+		total += r.S
+	}
+	for d := 1; d <= daysInMonth; d++ {
+		out.Days[d-1] = DailyCommission{Day: d, Amount: m[d]}
+	}
+	out.MonthTotal = total
+	c.JSON(200, out)
+}
+
 /* ===== MAIN & CORS ===== */
 func main() {
 	connectDB()
+	cleanupExpiredPromoCodes()
 
 	r := gin.Default()
 	r.MaxMultipartMemory = 16 << 20 // 16 MiB
@@ -1927,6 +3072,14 @@ func main() {
 	priv.PUT("/security", updateSecurityHandler)
 	priv.PUT("/kyc", updateKycHandler)
 	priv.POST("/kyc", kycSubmitHandler)
+	priv.GET("/notifications", listNotificationsHandler)
+	priv.PUT("/notifications/mark-read", markReadNotificationsHandler)
+	priv.POST("/redeem-code", redeemCodeHandler) // 👈 user nhập code
+	priv.GET("/dashboard/overview", dashboardOverviewHandler)
+	priv.GET("/dashboard/commissions", dashboardCommissionsHandler)
+
+	priv.GET("/downlines", myDownlinesHandler)
+	priv.GET("/downlines/:id/dashboard", downlineDashboardHandler)
 
 	// Admin
 	admin := r.Group("/admin")
@@ -1939,6 +3092,8 @@ func main() {
 	admin.GET("/kyc/:userId/back", adminServeKycBack)
 	admin.GET("/kyc-file/:userId/:side", adminGetKycImage)
 	admin.GET("/users/:id", adminUserDetailHandler)
+	admin.POST("/promo-codes", adminCreatePromoCodeHandler)
+	admin.GET("/promo-codes", adminListActivePromoCodesHandler)
 
 	fmt.Println("🚀 Server running at :" + PORT)
 	_ = r.Run(":" + PORT)
