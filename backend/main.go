@@ -40,11 +40,12 @@ var uploadsAbs string
 var kycAbs string
 
 type DashboardOverview struct {
-	TotalAssets           int64 `json:"totalAssets"` // coins + bonusCoins
+	TotalAssets           int64 `json:"totalAssets"`
 	F1Count               int64 `json:"f1Count"`
 	F1CommissionTotal     int64 `json:"f1CommissionTotal"`
-	SystemCount           int64 `json:"systemCount"`           // F1..F9
-	SystemCommissionTotal int64 `json:"systemCommissionTotal"` // depth 1..9
+	SystemCount           int64 `json:"systemCount"`
+	SystemCommissionTotal int64 `json:"systemCommissionTotal"`
+	VipLevel              int   `json:"vipLevel"`
 }
 type DailyCommission struct {
 	Day    int   `json:"day"`
@@ -78,7 +79,7 @@ type DownlineRow struct {
 	ID        uint   `json:"id"`
 	Username  string `json:"username"`
 	Depth     int    `json:"depth"`
-	VIPLevel  int    `gorm:"column:v_ip_level;not null;default:0" json:"vipLevel"`
+	VIPLevel  int    ` json:"vipLevel"`
 	CreatedAt string `json:"createdAt"`
 }
 type WithdrawRequest struct {
