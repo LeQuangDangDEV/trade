@@ -124,6 +124,16 @@ type User struct {
 	FreeSpins      int `gorm:"not null;default:0" json:"freeSpins"`
 	ChestOpenCount int `gorm:"not null;default:0"`
 }
+type LeaderboardRow struct {
+	Rank     int    `json:"rank"`
+	Username string `json:"username"`
+	Score    int64  `json:"score"`
+}
+type MyRankResp struct {
+	Rank     int    `json:"rank"`
+	Username string `json:"username"`
+	Score    int64  `json:"score"`
+}
 
 type ChangePasswordRequest struct {
 	OldPassword string `json:"oldPassword" binding:"required"`
@@ -220,6 +230,7 @@ type TransferRow struct {
 	Amount      int64     `json:"amount"`
 	Fee         int64     `json:"fee"`
 	Counterpart string    `json:"counterpart"` // username đối tác
+	Note        string    `json:"note"`
 	CreatedAt   time.Time `json:"createdAt"`
 }
 type WithdrawTxn struct {
@@ -386,6 +397,17 @@ type InventoryItem struct {
 	CreatedAt time.Time `json:"-"`
 	UpdatedAt time.Time `json:"-"`
 }
+type PromoBonusCode struct {
+	ID         uint       `gorm:"primaryKey"`
+	Code       string     `gorm:"size:32;uniqueIndex;not null"`
+	BonusCoins int        `gorm:"not null;default:10"` // ⭐ mặc định 10
+	MaxUses    int        `gorm:"not null;default:1"`  // ⭐ one-shot
+	UsedCount  int        `gorm:"not null;default:0"`
+	ExpiresAt  *time.Time `gorm:"index"`
+	IsActive   bool       `gorm:"not null;default:true"`
+	CreatedBy  *uint
+	CreatedAt  time.Time
+}
 
 // log mở rương
 type ChestTxn struct {
@@ -402,6 +424,7 @@ type DashOverview struct {
 	F1Count               int64 `json:"f1Count"`
 	F1CommissionTotal     int64 `json:"f1CommissionTotal"`     // depth=1
 	SystemCommissionTotal int64 `json:"systemCommissionTotal"` // depth 1..9
+	SystemCount           int64 `json:"systemCount"`
 }
 
 type DayEarning struct {
@@ -483,7 +506,7 @@ func connectDB() {
 		&WithdrawTxn{},
 		&InventoryItem{}, &ChestTxn{}, &MarketListing{},
 		&Notification{},
-		&PromoCode{}, &PromoCodeUse{},
+		&PromoCode{}, &PromoCodeUse{}, &PromoBonusCode{},
 	); err != nil {
 		log.Fatal("❌ AutoMigrate error:", err)
 	}
@@ -497,6 +520,16 @@ func getAnyAdmin(tx *gorm.DB) (User, error) {
 	var admin User
 	err := tx.Where("role = ?", "admin").Order("id ASC").First(&admin).Error
 	return admin, err
+}
+
+// kind = "f1" | "system"
+func lbDepthCond(kind string) (string, []any) {
+	switch strings.ToLower(kind) {
+	case "f1":
+		return "ct.depth = 1", nil
+	default:
+		return "ct.depth BETWEEN 1 AND 9", nil
+	}
 }
 
 // Trả về danh sách ID F1 và toàn bộ F1..F9 (không trùng)
@@ -681,6 +714,107 @@ func overviewStatsHandler(c *gin.Context) {
 		"systemCommissionGross": systemCommissionGross,
 	})
 }
+func publicLeaderboardHandler(c *gin.Context) {
+	kind := strings.ToLower(c.DefaultQuery("kind", "f1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+
+	// đổi TÊN CỘT ở đây nếu schema khác:
+	benefCol := "ct.beneficiary_id" // ví dụ: "ct.beneficiary_id" nếu bạn đặt khác
+	amountCol := "ct.amount"
+	depthCol := "ct.depth"
+
+	depthCond := fmt.Sprintf("%s = 1", depthCol)
+	if kind != "f1" {
+		depthCond = fmt.Sprintf("%s BETWEEN 1 AND 9", depthCol)
+	}
+
+	type aggRow struct {
+		UserID   uint
+		Username string
+		Score    int64
+	}
+	var agg []aggRow
+
+	// Tổng hoa hồng theo user
+	err := DB.Table("commission_txns AS ct").
+		Select(fmt.Sprintf("%s AS user_id, u.username, SUM(%s) AS score", benefCol, amountCol)).
+		Joins("JOIN users u ON u.id = "+benefCol).
+		Where("u.role = ?", "user").
+		Where(depthCond).
+		Group("user_id, u.username").
+		Order("score DESC").
+		Limit(limit).
+		Scan(&agg).Error
+
+	if err != nil {
+		// LOG lỗi thật để biết vì sao 500 (sai cột/bảng, v.v.)
+		log.Println("leaderboard query error:", err)
+		// Tránh vỡ FE: trả rỗng
+		c.JSON(200, gin.H{"rows": []LeaderboardRow{}})
+		return
+	}
+
+	rows := make([]LeaderboardRow, 0, len(agg))
+	for i, r := range agg {
+		rows = append(rows, LeaderboardRow{
+			Rank: i + 1, Username: r.Username, Score: r.Score,
+		})
+	}
+	c.JSON(200, gin.H{"rows": rows})
+}
+func privateMyLeaderboardHandler(c *gin.Context) {
+	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+	kind := strings.ToLower(c.DefaultQuery("kind", "f1"))
+
+	// lấy username (không lỗi cũng tiếp tục)
+	var uname string
+	_ = DB.Table("users").Select("username").Where("id = ?", uid).Scan(&uname).Error
+
+	// ĐỔI tên cột nếu schema bạn khác
+	benefCol := "ct.beneficiary_id"
+	amountCol := "ct.amount"
+	depthCol := "ct.depth"
+
+	depthCond := fmt.Sprintf("%s = 1", depthCol) // F1
+	if kind != "f1" {
+		depthCond = fmt.Sprintf("%s BETWEEN 1 AND 9", depthCol) // Hệ thống
+	}
+
+	// Tổng điểm của chính mình (không phụ thuộc role, vì người dùng hiện tại là user)
+	var my struct{ Score int64 }
+	_ = DB.Table("commission_txns AS ct").
+		Where(benefCol+" = ?", uid).
+		Where(depthCond).
+		Select("COALESCE(SUM(" + amountCol + "),0) AS score").
+		Scan(&my).Error
+
+	// Subquery tổng điểm MỖI USER THƯỜNG (exclude admin)
+	sub := DB.Table("commission_txns AS ct").
+		Joins("JOIN users u ON u.id = "+benefCol).
+		Where("u.role = ?", "user").
+		Where(depthCond).
+		Select(benefCol + " AS user_id, SUM(" + amountCol + ") AS score").
+		Group("user_id")
+
+	// Rank = 1 + số người (user thường) có điểm > mình
+	var higher int64
+	if err := DB.Table("(?) AS t", sub).
+		Where("t.score > ?", my.Score).
+		Count(&higher).Error; err != nil {
+		log.Println("my leaderboard rank error:", err)
+		c.JSON(200, MyRankResp{Rank: 0, Username: uname, Score: my.Score})
+		return
+	}
+
+	c.JSON(200, MyRankResp{
+		Rank:     int(higher) + 1, // FE hiển thị # nếu > 100
+		Username: uname,
+		Score:    my.Score,
+	})
+}
 
 /* ===== MIDDLEWARE ===== */
 func authRequired() gin.HandlerFunc {
@@ -701,6 +835,60 @@ func authRequired() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func redeemBonusCodeHandler(c *gin.Context) {
+	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := c.BindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "Thiếu mã code"})
+		return
+	}
+	code := strings.ToUpper(strings.TrimSpace(body.Code)) // 👈 quan trọng
+
+	var p PromoBonusCode
+	if err := DB.Where("code = ? AND is_active = ?", code, true).First(&p).Error; err != nil {
+		c.JSON(400, gin.H{"error": "Code không tồn tại hoặc đã bị vô hiệu"})
+		return
+	}
+	if p.ExpiresAt != nil && time.Now().UTC().After(*p.ExpiresAt) {
+		c.JSON(400, gin.H{"error": "Code đã hết hạn"})
+		return
+	}
+	if p.UsedCount >= p.MaxUses {
+		c.JSON(400, gin.H{"error": "Code đã được sử dụng"})
+		return
+	}
+
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		// tăng used_count (optimistic)
+		res := tx.Model(&PromoBonusCode{}).
+			Where("id = ? AND used_count = ?", p.ID, p.UsedCount).
+			UpdateColumn("used_count", gorm.Expr("used_count + 1"))
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return errors.New("conflict")
+		}
+
+		// cộng bonus_coins
+		return tx.Model(&User{}).
+			Where("id = ?", uid).
+			UpdateColumn("bonus_coins", gorm.Expr("COALESCE(bonus_coins,0)+?", p.BonusCoins)).Error
+	})
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Không thể sử dụng code"})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"message":    "Nhận coin bonus thành công",
+		"bonusCoins": p.BonusCoins,
+	})
 }
 
 func adminRequired() gin.HandlerFunc {
@@ -798,11 +986,16 @@ func downlineDashboardHandler(c *gin.Context) {
 		Select("coins, IFNULL(bonus_coins,0) as bonus_coins").Scan(&t).Error
 	ov.TotalAssets = t.Coins + t.BonusCoins
 
-	// F1 count
+	// F1 count (trực tiếp)
 	DB.Model(&User{}).Where("referred_by = ?", targetID).Count(&ov.F1Count)
 
-	// Hoa hồng F1 & hệ thống (depth 1..9) đổ vào ví **đã được cộng khi phát sinh**,
-	// ở đây chỉ tính tổng để hiển thị.
+	// 👇 SystemCount: tất cả tuyến dưới depth 1..9 (dùng closure table 'downlines')
+	// Đổi tên bảng/cột nếu schema của bạn khác.
+	_ = DB.Table("downlines AS dl").
+		Where("dl.ancestor_id = ? AND dl.depth BETWEEN 1 AND 9", targetID).
+		Count(&ov.SystemCount).Error
+
+	// Hoa hồng F1 (depth=1) & hệ thống (1..9) - tổng toàn thời gian
 	DB.Model(&CommissionTxn{}).
 		Where("beneficiary_id = ? AND depth = 1", targetID).
 		Select("COALESCE(SUM(amount),0)").Scan(&ov.F1CommissionTotal)
@@ -845,6 +1038,7 @@ func downlineDashboardHandler(c *gin.Context) {
 	}
 	c.JSON(200, resp)
 }
+
 func vipHistoryHandler(c *gin.Context) {
 	uid := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
 	var rows []VipBuyRow
@@ -862,6 +1056,7 @@ func transferHistoryHandler(c *gin.Context) {
 			t.id,
 			IF(t.from_id = ?, 'out', 'in') AS direction,
 			t.amount, t.fee, t.created_at,
+			 COALESCE(t.note, '') AS note,  
 			CASE WHEN t.from_id = ? THEN to_u.username ELSE from_u.username END AS counterpart`,
 			uid, uid).
 		Joins("LEFT JOIN users from_u ON from_u.id = t.from_id").
@@ -1239,23 +1434,23 @@ func registerHandler(c *gin.Context) {
 			PasswordHash: string(hash),
 			Role:         "user",
 			Coins:        0,
-			BonusCoins:   100, // tặng coin bonus
+			/*	BonusCoins:   100, // tặng coin bonus*/
 			TotalTopup:   0,
 			VIPLevel:     0,
 			ReferralCode: &code,
 			ReferredBy:   referredBy,
-			FreeSpins:    10, // tặng lượt quay
+			/*FreeSpins:    10, // tặng lượt quay */
 		}
 		if err := tx.Create(&u).Error; err != nil {
 			return fmt.Errorf("create user: %w", err)
 		}
 
-		// Gửi thông báo chào mừng
+		/*// Gửi thông báo chào mừng
 		_ = tx.Create(&Notification{
 			UserID: u.ID,
 			Title:  "Chào mừng!",
 			Body:   "Bạn đã nhận được 100 coin bonus và 10 lượt quay miễn phí khi đăng ký.",
-		}).Error
+		}).Error*/
 
 		return nil
 	}); err != nil {
@@ -1834,21 +2029,89 @@ func adminCreatePromoCodeHandler(c *gin.Context) {
 	})
 }
 
+// POST /admin/promo-bonus-codes
+func adminCreateBonusCodesHandler(c *gin.Context) {
+	adminID := uint(c.MustGet("claims").(jwt.MapClaims)["sub"].(float64))
+
+	var body struct {
+		Count         int  `json:"count"`         // số code muốn tạo (mặc định 1)
+		BonusCoins    *int `json:"bonusCoins"`    // mặc định 10
+		DurationHours *int `json:"durationHours"` // nếu có: hết hạn sau N giờ
+	}
+	_ = c.BindJSON(&body)
+
+	count := body.Count
+	if count <= 0 || count > 500 {
+		count = 1
+	}
+
+	coins := 10
+	if body.BonusCoins != nil && *body.BonusCoins > 0 {
+		coins = *body.BonusCoins
+	}
+
+	var expiresAt *time.Time
+	if body.DurationHours != nil && *body.DurationHours > 0 {
+		t := time.Now().UTC().Add(time.Duration(*body.DurationHours) * time.Hour)
+		expiresAt = &t
+	}
+
+	codes := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		// sinh code + đảm bảo unique (thử tối đa 8 lần để tránh vòng lặp vô hạn)
+		var code string
+		for try := 0; try < 8; try++ {
+			val, err := randCode(10) // 👈 dùng helper của bạn: (string, error)
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Không tạo được mã (rng error)"})
+				return
+			}
+			code = strings.ToUpper(val) // optional: chuẩn hoá về chữ hoa
+
+			var exists int64
+			if err := DB.Model(&PromoBonusCode{}).Where("code = ?", code).Count(&exists).Error; err != nil {
+				c.JSON(500, gin.H{"error": "Lỗi kiểm tra trùng code"})
+				return
+			}
+			if exists == 0 {
+				break
+			}
+			if try == 7 {
+				c.JSON(500, gin.H{"error": "Không thể tạo code unique, thử lại sau"})
+				return
+			}
+		}
+
+		p := PromoBonusCode{
+			Code:       code,
+			BonusCoins: coins,
+			MaxUses:    1, // one-shot
+			UsedCount:  0,
+			ExpiresAt:  expiresAt,
+			IsActive:   true,
+			CreatedBy:  &adminID,
+		}
+		if err := DB.Create(&p).Error; err != nil {
+			c.JSON(500, gin.H{"error": "Tạo code thất bại"})
+			return
+		}
+		codes = append(codes, code)
+	}
+
+	c.JSON(200, gin.H{
+		"message":   "Đã tạo code bonus",
+		"codes":     codes,
+		"bonus":     coins,
+		"count":     count,
+		"expiresAt": expiresAt,
+	})
+}
+
 // GET /admin/promo-codes
 func adminListActivePromoCodesHandler(c *gin.Context) {
 	nowUTC := time.Now().UTC()
 
-	var pcs []PromoCode
-	if err := DB.
-		Where("is_active = ? AND (expires_at IS NULL OR expires_at > ?)", true, nowUTC).
-		Order("expires_at ASC, created_at DESC").
-		Limit(100).
-		Find(&pcs).Error; err != nil {
-		c.JSON(500, gin.H{"error": "Không lấy được danh sách code"})
-		return
-	}
-
-	// map thành định dạng frontend đang dùng (code/value/expiresAt/createdAt)
+	// Map đúng shape FE đang dùng
 	type Row struct {
 		ID        uint       `json:"id"`
 		Code      string     `json:"code"`
@@ -1856,18 +2119,35 @@ func adminListActivePromoCodesHandler(c *gin.Context) {
 		ExpiresAt *time.Time `json:"expiresAt"`
 		CreatedAt time.Time  `json:"createdAt"`
 	}
-	out := make([]Row, 0, len(pcs))
-	for _, p := range pcs {
-		out = append(out, Row{
-			ID:        p.ID,
-			Code:      p.Code,
-			Value:     p.RewardFreeSpin,
-			ExpiresAt: p.ExpiresAt,
-			CreatedAt: p.CreatedAt,
-		})
+
+	var rows []Row
+
+	// Lọc:
+	// - còn hoạt động
+	// - chưa hết hạn (hoặc không có hạn)
+	// - chưa dùng hết lượt (MaxUses NULL => vô hạn)
+	err := DB.
+		Table("promo_codes").
+		Select(`
+			id,
+			code,
+			reward_free_spin AS value,
+			expires_at,
+			created_at
+		`).
+		Where("is_active = ?", true).
+		Where("(expires_at IS NULL OR expires_at > ?)", nowUTC).
+		Where("(max_uses IS NULL OR used_count < max_uses)").
+		Order("expires_at ASC, created_at DESC").
+		Limit(100).
+		Scan(&rows).Error
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Không lấy được danh sách code"})
+		return
 	}
 
-	c.JSON(200, gin.H{"rows": out})
+	c.JSON(200, gin.H{"rows": rows})
 }
 
 func redeemCodeHandler(c *gin.Context) {
@@ -2683,8 +2963,8 @@ func transferHandler(c *gin.Context) {
 		return
 	}
 
-	// Phí 0.5% (làm tròn lên)
-	fee := (req.Amount*5 + 999) / 1000 // ceil(amount*0.005)
+	// Phí 1% (làm tròn lên)
+	fee := (req.Amount*1 + 99) / 100 // ceil(amount*0.01)
 	totalDebit := req.Amount + fee
 
 	// Giao dịch
@@ -2913,7 +3193,7 @@ func myDownlinesHandler(c *gin.Context) {
 		if len(currentLevel) > 0 {
 			if err := DB.
 				Where("referred_by IN ?", currentLevel).
-				Select("id, username, v_ip_level as vip_level, created_at").
+				Select("id, username, v_ip_level , created_at").
 				Find(&users).Error; err != nil {
 				c.JSON(500, gin.H{"error": "Không tải được tuyến dưới"})
 				return
@@ -3041,6 +3321,7 @@ func main() {
 	r.GET("/vip-tiers", getVipTiersHandler)
 	r.GET("/market", marketQueryHandler)
 	r.POST("/forgot-password", forgotPasswordHandler)
+	r.GET("/public/leaderboard", publicLeaderboardHandler)
 
 	// Private
 	priv := r.Group("/private")
@@ -3078,9 +3359,10 @@ func main() {
 	priv.POST("/redeem-code", redeemCodeHandler) // 👈 user nhập code
 	priv.GET("/dashboard/overview", dashboardOverviewHandler)
 	priv.GET("/dashboard/commissions", dashboardCommissionsHandler)
-
+	priv.POST("/redeem-bonus-code", redeemBonusCodeHandler)
 	priv.GET("/downlines", myDownlinesHandler)
 	priv.GET("/downlines/:id/dashboard", downlineDashboardHandler)
+	priv.GET("/leaderboard/me", privateMyLeaderboardHandler)
 
 	// Admin
 	admin := r.Group("/admin")
@@ -3095,6 +3377,7 @@ func main() {
 	admin.GET("/users/:id", adminUserDetailHandler)
 	admin.POST("/promo-codes", adminCreatePromoCodeHandler)
 	admin.GET("/promo-codes", adminListActivePromoCodesHandler)
+	admin.POST("/promo-bonus-codes", adminCreateBonusCodesHandler)
 
 	fmt.Println("🚀 Server running at :" + PORT)
 	_ = r.Run(":" + PORT)
